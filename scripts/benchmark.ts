@@ -33,8 +33,8 @@ const ROOT = path.resolve(import.meta.dirname!, '..');
 
 const ALL_MODELS: ModelConfig[] = [
   { name: 'flash-lite', modelId: 'gemini-2.0-flash-lite' },
-  { name: 'flash', modelId: 'gemini-2.0-flash' },
-  { name: 'pro', modelId: 'gemini-2.5-pro-preview-05-06' },
+  { name: 'flash', modelId: 'gemini-2.5-flash' },
+  { name: 'pro', modelId: 'gemini-2.5-pro' },
 ];
 
 const STUDENT_MODEL: ModelConfig = {
