@@ -30,9 +30,8 @@ import { PathTracker } from '../src/tracking/PathTracker.js';
 import { RecommendationEngine } from '../src/recommendation/RecommendationEngine.js';
 import { TreeExecutor } from '../src/execution/TreeExecutor.js';
 import { GeminiAdapter } from '../src/adapters/GeminiAdapter.js';
-import { MockDecisionMaker } from '../src/execution/TreeExecutor.js';
 import { TreeSerializer } from '../src/serialization/TreeSerializer.js';
-import type { ToolHandler, ExecutionEvents, IDecisionMaker } from '../src/execution/TreeExecutor.js';
+import type { ToolHandler, ExecutionEvents } from '../src/execution/TreeExecutor.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -504,67 +503,10 @@ Use the analyzed data from context variables to write accurate documentation. Re
   return tree;
 }
 
-// ─── Custom Decision Maker that also generates content ────────────────────────
-//
-// For ConversationNodes that generate content (genArchitecture, genReadme),
-// we intercept the call, use Gemini to generate content, stash it in context,
-// and then pick the single outgoing edge.
-//
-// For the "decideDepth" branch, we let Gemini actually choose.
-
-class ContentGeneratingDecisionMaker implements IDecisionMaker {
-  private inner: IDecisionMaker;
-  private geminiModel: import('@google/generative-ai').GenerativeModel;
-  private contentStore: Map<string, string> = new Map();
-
-  constructor(
-    inner: IDecisionMaker,
-    geminiModel: import('@google/generative-ai').GenerativeModel,
-  ) {
-    this.inner = inner;
-    this.geminiModel = geminiModel;
-  }
-
-  getContent(nodeId: string): string | undefined {
-    return this.contentStore.get(nodeId);
-  }
-
-  async decide(
-    context: import('../src/adapters/ILLMDecisionTreeAdapter.js').DecisionContext,
-  ): Promise<{ chosenEdgeId: string; reasoning?: string }> {
-    const node = context.currentNode;
-    const data = (node as { data?: { prompt?: string } }).data;
-
-    // For content-generating nodes, call Gemini with the full context
-    if (
-      node.id === 'genArchitecture' ||
-      node.id === 'genReadme'
-    ) {
-      const vars = (context.metadata['variables'] ?? {}) as Record<
-        string,
-        unknown
-      >;
-      const prompt = `${data?.prompt ?? ''}\n\nProject data:\n${JSON.stringify(vars, null, 2).slice(0, 15000)}`;
-
-      console.log(`  [Gemini] Generating content for ${node.id}...`);
-      const result = await this.geminiModel.generateContent(prompt);
-      const content = result.response.text();
-      this.contentStore.set(node.id, content);
-      console.log(
-        `  [Gemini] Generated ${content.length} chars for ${node.id}`,
-      );
-
-      // Pick the single outgoing edge
-      return {
-        chosenEdgeId: context.availableEdges[0]!.id,
-        reasoning: `Generated content (${content.length} chars)`,
-      };
-    }
-
-    // For the depth decision, use the inner decision maker (Gemini adapter)
-    return this.inner.decide(context);
-  }
-}
+// ─── Content generation ───────────────────────────────────────────────────────
+// Content is generated inside the write tool handlers themselves (which are
+// async and properly awaited by the executor), ensuring the content is ready
+// before being written to disk.
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
@@ -605,31 +547,51 @@ async function main() {
     maxOutputTokens: 100,
   });
 
-  const contentDecisionMaker = new ContentGeneratingDecisionMaker(
-    geminiAdapter,
-    geminiModel,
-  );
-
   // Set up tracking
   const tracker = new PathTracker();
 
-  // Wrap tool handlers to inject generated content for write operations
+  // Wrap tool handlers — the write handlers generate content via Gemini first
   const wrappedToolHandlers = new Map(toolHandlers);
 
-  const origWriteReadme = toolHandlers.get('writeReadme')!;
-  wrappedToolHandlers.set('writeReadme', async (params) => {
-    const content =
-      contentDecisionMaker.getContent('genReadme') ??
-      (params['content'] as string);
-    return origWriteReadme({ content });
+  // Helper to get accumulated variables from the executor's context
+  // We'll capture them from onStepStart events
+  let latestVariables: Record<string, unknown> = {};
+
+  const archPrompt = (
+    tree.getNode('genArchitecture') as { data?: { prompt?: string } }
+  ).data?.prompt ?? '';
+  const readmePrompt = (
+    tree.getNode('genReadme') as { data?: { prompt?: string } }
+  ).data?.prompt ?? '';
+
+  // Strip wrapping code fences that Gemini sometimes adds
+  function stripCodeFences(text: string): string {
+    let s = text.trim();
+    if (s.startsWith('```markdown')) s = s.slice('```markdown'.length);
+    else if (s.startsWith('```md')) s = s.slice('```md'.length);
+    else if (s.startsWith('```')) s = s.slice(3);
+    if (s.endsWith('```')) s = s.slice(0, -3);
+    return s.trim();
+  }
+
+  wrappedToolHandlers.set('writeArchitecture', async () => {
+    console.log('  [Gemini] Generating architecture doc...');
+    const fullPrompt = `${archPrompt}\n\nProject data:\n${JSON.stringify(latestVariables, null, 2).slice(0, 15000)}`;
+    const result = await geminiModel.generateContent(fullPrompt);
+    const content = stripCodeFences(result.response.text());
+    console.log(`  [Gemini] Generated ${content.length} chars`);
+    writeOutput('generated-ARCHITECTURE.md', content);
+    return { written: true, path: 'generated-ARCHITECTURE.md', bytes: content.length };
   });
 
-  const origWriteArch = toolHandlers.get('writeArchitecture')!;
-  wrappedToolHandlers.set('writeArchitecture', async (params) => {
-    const content =
-      contentDecisionMaker.getContent('genArchitecture') ??
-      (params['content'] as string);
-    return origWriteArch({ content });
+  wrappedToolHandlers.set('writeReadme', async () => {
+    console.log('  [Gemini] Generating README...');
+    const fullPrompt = `${readmePrompt}\n\nProject data:\n${JSON.stringify(latestVariables, null, 2).slice(0, 15000)}`;
+    const result = await geminiModel.generateContent(fullPrompt);
+    const content = stripCodeFences(result.response.text());
+    console.log(`  [Gemini] Generated ${content.length} chars`);
+    writeOutput('generated-README.md', content);
+    return { written: true, path: 'generated-README.md', bytes: content.length };
   });
 
   // Serialize the tree itself for the serialize step
@@ -640,12 +602,13 @@ async function main() {
     return { written: true, path: 'generated-tree-definition.json' };
   });
 
-  // Set up events for logging
+  // Set up events for logging + capturing variables
   const events: ExecutionEvents = {
     onStepStart: (ctx, node) => {
       console.log(
         `  [Step ${ctx.stepCount + 1}] Entering: ${node.label} (${node.type}) [${node.id}]`,
       );
+      latestVariables = ctx.variables;
     },
     onToolCall: (nodeId, toolName, result) => {
       const preview =
@@ -674,7 +637,7 @@ async function main() {
   console.log('3. Starting execution...\n');
   const executor = new TreeExecutor(
     tree,
-    contentDecisionMaker,
+    geminiAdapter,
     tracker,
     {
       maxSteps: 30,
