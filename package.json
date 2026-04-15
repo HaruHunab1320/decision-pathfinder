@@ -1,0 +1,43 @@
+{
+  "name": "modular-decision-tree-library",
+  "version": "1.0.0",
+  "description": "A modular decision tree library for LLM-driven workflows",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "lint": "biome check",
+    "lint:fix": "biome check --write",
+    "demo": "tsx scripts/demo-readme-generator.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "decision-tree",
+    "llm",
+    "gemini",
+    "ai-agent"
+  ],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@google/generative-ai": "^0.24.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.4.10",
+    "@types/node": "^25.5.2",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.2",
+    "vitest": "^4.1.2"
+  }
+}
