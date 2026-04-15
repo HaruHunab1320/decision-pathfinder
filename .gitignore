@@ -1,6 +1,8 @@
 node_modules/
 dist/
 generated-*
+.env
+.env.*
 
 # orchestrator-injected (do not commit agent config/memory files)
 CLAUDE.md
