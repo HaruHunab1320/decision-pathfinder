@@ -19,6 +19,7 @@
     "lint": "biome check",
     "lint:fix": "biome check --write",
     "demo": "tsx scripts/demo-readme-generator.ts",
+    "benchmark": "tsx scripts/benchmark.ts",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
