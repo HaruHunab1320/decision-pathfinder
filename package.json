@@ -1,7 +1,7 @@
 {
-  "name": "modular-decision-tree-library",
+  "name": "decision-pathfinder",
   "version": "1.0.0",
-  "description": "A modular decision tree library for LLM-driven workflows",
+  "description": "A modular decision tree engine for LLM-driven workflows — build, execute, and analyze decision paths with Gemini Flash Lite",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
@@ -23,9 +23,11 @@
   },
   "keywords": [
     "decision-tree",
+    "pathfinder",
     "llm",
     "gemini",
-    "ai-agent"
+    "ai-agent",
+    "tree-executor"
   ],
   "author": "",
   "license": "ISC",
