@@ -4,6 +4,7 @@ import type {
   AggregateMetrics,
   BenchmarkReport,
   BenchmarkConfig,
+  ModelSummary,
 } from '../types.js';
 
 function computeMetrics(runs: RunResult[]): AggregateMetrics {
@@ -45,109 +46,156 @@ function computeMetrics(runs: RunResult[]): AggregateMetrics {
   };
 }
 
+function computeImprovement(phaseA: AggregateMetrics, phaseB: AggregateMetrics) {
+  const successRateDiff = phaseB.successRate - phaseA.successRate;
+  const stepsDiff = phaseB.avgSteps - phaseA.avgSteps;
+  const durationDiff = phaseB.avgDurationMs - phaseA.avgDurationMs;
+  const errorReduction = phaseA.totalErrors > 0
+    ? (1 - phaseB.totalErrors / phaseA.totalErrors) * 100
+    : 0;
+
+  return {
+    successRate: `${successRateDiff >= 0 ? '+' : ''}${(successRateDiff * 100).toFixed(1)}%`,
+    avgSteps: `${stepsDiff >= 0 ? '+' : ''}${stepsDiff.toFixed(1)}`,
+    avgDuration: `${durationDiff >= 0 ? '+' : ''}${durationDiff.toFixed(0)}ms`,
+    errorReduction: `${errorReduction >= 0 ? '-' : '+'}${Math.abs(errorReduction).toFixed(1)}%`,
+  };
+}
+
 export function generateReport(
   scenarios: ScenarioResult[],
   config: BenchmarkConfig,
 ): BenchmarkReport {
-  const allPhaseA = scenarios.flatMap((s) => s.phaseA);
-  const allPhaseB = scenarios.flatMap((s) => s.phaseB);
+  // Group by Phase A model
+  const byModel = new Map<string, ScenarioResult[]>();
+  for (const s of scenarios) {
+    const key = s.phaseAModel;
+    if (!byModel.has(key)) byModel.set(key, []);
+    byModel.get(key)!.push(s);
+  }
 
-  const phaseAMetrics = computeMetrics(allPhaseA);
-  const phaseBMetrics = computeMetrics(allPhaseB);
+  const modelSummaries: ModelSummary[] = [];
+  for (const [modelName, modelScenarios] of byModel) {
+    const allA = modelScenarios.flatMap((s) => s.phaseA);
+    const allB = modelScenarios.flatMap((s) => s.phaseB);
+    const phaseA = computeMetrics(allA);
+    const phaseB = computeMetrics(allB);
 
-  const successRateDiff = phaseBMetrics.successRate - phaseAMetrics.successRate;
-  const stepsDiff = phaseBMetrics.avgSteps - phaseAMetrics.avgSteps;
-  const durationDiff = phaseBMetrics.avgDurationMs - phaseAMetrics.avgDurationMs;
-  const errorReduction = phaseAMetrics.totalErrors > 0
-    ? (1 - phaseBMetrics.totalErrors / phaseAMetrics.totalErrors) * 100
-    : 0;
+    modelSummaries.push({
+      phaseAModel: modelName,
+      phaseBModel: modelScenarios[0]!.phaseBModel,
+      phaseA,
+      phaseB,
+      improvement: computeImprovement(phaseA, phaseB),
+    });
+  }
 
   return {
     timestamp: new Date().toISOString(),
-    model: 'gemini-2.0-flash-lite',
     config,
     scenarios,
-    summary: {
-      phaseA: phaseAMetrics,
-      phaseB: phaseBMetrics,
-      improvement: {
-        successRate: `${successRateDiff >= 0 ? '+' : ''}${(successRateDiff * 100).toFixed(1)}%`,
-        avgSteps: `${stepsDiff >= 0 ? '+' : ''}${stepsDiff.toFixed(1)}`,
-        avgDuration: `${durationDiff >= 0 ? '+' : ''}${durationDiff.toFixed(0)}ms`,
-        errorReduction: `${errorReduction >= 0 ? '-' : '+'}${Math.abs(errorReduction).toFixed(1)}%`,
-      },
-    },
+    modelSummaries,
   };
 }
 
 export function generateMarkdown(report: BenchmarkReport): string {
   const lines: string[] = [];
-  const { summary } = report;
 
   lines.push('# Benchmark Report — decision-pathfinder');
   lines.push(`Generated: ${report.timestamp}`);
-  lines.push(`Model: ${report.model} | Runs per phase: ${report.config.runsPerPhase}`);
-  lines.push(`Override threshold: ${report.config.overrideThreshold} | Bias threshold: ${report.config.biasThreshold}`);
+  lines.push(`Runs per phase: ${report.config.runsPerPhase} | Override: ${report.config.overrideThreshold} | Bias: ${report.config.biasThreshold}`);
   lines.push('');
 
-  // Summary table
-  lines.push('## Summary');
+  // ── Cross-model comparison table ──
+  lines.push('## Cross-Model Comparison');
   lines.push('');
-  lines.push('| Metric | Phase A (Baseline) | Phase B (Guided) | Change |');
-  lines.push('|--------|-------------------|------------------|--------|');
-  lines.push(`| Success Rate | ${(summary.phaseA.successRate * 100).toFixed(1)}% | ${(summary.phaseB.successRate * 100).toFixed(1)}% | ${summary.improvement.successRate} |`);
-  lines.push(`| Avg Steps | ${summary.phaseA.avgSteps.toFixed(1)} | ${summary.phaseB.avgSteps.toFixed(1)} | ${summary.improvement.avgSteps} |`);
-  lines.push(`| Avg Duration | ${summary.phaseA.avgDurationMs.toFixed(0)}ms | ${summary.phaseB.avgDurationMs.toFixed(0)}ms | ${summary.improvement.avgDuration} |`);
-  lines.push(`| Errors (fail+err+max) | ${summary.phaseA.totalErrors} | ${summary.phaseB.totalErrors} | ${summary.improvement.errorReduction} |`);
+  lines.push('Phase A (teacher) builds history, Phase B (student = flash-lite) follows recommendations.');
+  lines.push('');
+  lines.push('| Teacher Model | Phase A Success | Phase B Success | Change | Phase A Errors | Phase B Errors | Error Reduction |');
+  lines.push('|--------------|----------------|----------------|--------|---------------|---------------|-----------------|');
+
+  for (const ms of report.modelSummaries) {
+    lines.push(
+      `| ${ms.phaseAModel} | ${(ms.phaseA.successRate * 100).toFixed(1)}% | ${(ms.phaseB.successRate * 100).toFixed(1)}% | ${ms.improvement.successRate} | ${ms.phaseA.totalErrors} | ${ms.phaseB.totalErrors} | ${ms.improvement.errorReduction} |`,
+    );
+  }
   lines.push('');
 
-  // Per-scenario breakdown
-  lines.push('## Per-Scenario Breakdown');
+  // ── Latency comparison ──
+  lines.push('### Latency');
+  lines.push('');
+  lines.push('| Teacher Model | Phase A Avg Duration | Phase B Avg Duration | Change |');
+  lines.push('|--------------|---------------------|---------------------|--------|');
+  for (const ms of report.modelSummaries) {
+    lines.push(
+      `| ${ms.phaseAModel} | ${ms.phaseA.avgDurationMs.toFixed(0)}ms | ${ms.phaseB.avgDurationMs.toFixed(0)}ms | ${ms.improvement.avgDuration} |`,
+    );
+  }
   lines.push('');
 
-  for (const scenario of report.scenarios) {
-    const phaseA = computeMetrics(scenario.phaseA);
-    const phaseB = computeMetrics(scenario.phaseB);
-    const totalOverrides = scenario.phaseB.reduce((s, r) => s + r.overrideCount, 0);
-    const totalBias = scenario.phaseB.reduce((s, r) => s + r.biasCount, 0);
+  // ── Per-model, per-scenario breakdown ──
+  // Group scenarios by model
+  const byModel = new Map<string, ScenarioResult[]>();
+  for (const s of report.scenarios) {
+    const key = s.phaseAModel;
+    if (!byModel.has(key)) byModel.set(key, []);
+    byModel.get(key)!.push(s);
+  }
 
-    lines.push(`### ${scenario.scenarioName}`);
-    lines.push(`> ${scenario.scenarioDescription}`);
-    lines.push('');
-    lines.push('| | Phase A | Phase B |');
-    lines.push('|-|---------|---------|');
-    lines.push(`| Success | ${phaseA.successCount}/${phaseA.totalRuns} | ${phaseB.successCount}/${phaseB.totalRuns} |`);
-    lines.push(`| Failure | ${phaseA.failureCount} | ${phaseB.failureCount} |`);
-    lines.push(`| Error | ${phaseA.errorCount} | ${phaseB.errorCount} |`);
-    lines.push(`| Avg Steps | ${phaseA.avgSteps.toFixed(1)} | ${phaseB.avgSteps.toFixed(1)} |`);
-    lines.push(`| Avg Duration | ${phaseA.avgDurationMs.toFixed(0)}ms | ${phaseB.avgDurationMs.toFixed(0)}ms |`);
-    if (totalOverrides > 0 || totalBias > 0) {
-      lines.push(`| Overrides | — | ${totalOverrides} |`);
-      lines.push(`| Bias injections | — | ${totalBias} |`);
-    }
+  for (const [modelName, modelScenarios] of byModel) {
+    lines.push(`## Teacher: ${modelName}`);
     lines.push('');
 
-    // Run details
-    lines.push('<details><summary>Run details</summary>');
-    lines.push('');
-    for (const run of [...scenario.phaseA, ...scenario.phaseB]) {
-      const r = run.executionResult;
-      lines.push(`- Phase ${run.phase} Run ${run.runIndex + 1}: **${r.status}** (${r.stepCount} steps, ${run.durationMs}ms) path: \`${r.pathTaken.join(' -> ')}\``);
-    }
-    lines.push('');
-    lines.push('</details>');
-    lines.push('');
+    for (const scenario of modelScenarios) {
+      const phaseA = computeMetrics(scenario.phaseA);
+      const phaseB = computeMetrics(scenario.phaseB);
+      const totalOverrides = scenario.phaseB.reduce(
+        (s, r) => s + r.overrideCount,
+        0,
+      );
+      const totalBias = scenario.phaseB.reduce((s, r) => s + r.biasCount, 0);
 
-    // Bottleneck / recommendation info
-    if (scenario.optimizationReport.bottlenecks.length > 0) {
-      lines.push(`**Bottleneck nodes:** ${scenario.optimizationReport.bottlenecks.map((b) => `\`${b.nodeId}\` (${(b.failureCount / b.visitCount * 100).toFixed(0)}% fail rate)`).join(', ')}`);
+      lines.push(`### ${scenario.scenarioName}`);
+      lines.push(`> ${scenario.scenarioDescription}`);
       lines.push('');
-    }
-    if (scenario.optimizationReport.edgeRecommendations.length > 0) {
-      for (const { nodeId, recommendation } of scenario.optimizationReport.edgeRecommendations) {
-        lines.push(`**Recommendation at \`${nodeId}\`:** edge \`${recommendation.recommendedEdgeId}\` (confidence: ${(recommendation.confidence * 100).toFixed(1)}%) — ${recommendation.reasoning}`);
+      lines.push('| | Phase A | Phase B |');
+      lines.push('|-|---------|---------|');
+      lines.push(
+        `| Success | ${phaseA.successCount}/${phaseA.totalRuns} | ${phaseB.successCount}/${phaseB.totalRuns} |`,
+      );
+      lines.push(`| Failure | ${phaseA.failureCount} | ${phaseB.failureCount} |`);
+      lines.push(`| Error | ${phaseA.errorCount} | ${phaseB.errorCount} |`);
+      lines.push(
+        `| Avg Steps | ${phaseA.avgSteps.toFixed(1)} | ${phaseB.avgSteps.toFixed(1)} |`,
+      );
+      lines.push(
+        `| Avg Duration | ${phaseA.avgDurationMs.toFixed(0)}ms | ${phaseB.avgDurationMs.toFixed(0)}ms |`,
+      );
+      if (totalOverrides > 0 || totalBias > 0) {
+        lines.push(`| Overrides | — | ${totalOverrides} |`);
+        lines.push(`| Bias injections | — | ${totalBias} |`);
       }
       lines.push('');
+
+      // Run details
+      lines.push('<details><summary>Run details</summary>');
+      lines.push('');
+      for (const run of [...scenario.phaseA, ...scenario.phaseB]) {
+        const r = run.executionResult;
+        lines.push(
+          `- Phase ${run.phase} Run ${run.runIndex + 1}: **${r.status}** (${r.stepCount} steps, ${run.durationMs}ms) path: \`${r.pathTaken.join(' -> ')}\``,
+        );
+      }
+      lines.push('');
+      lines.push('</details>');
+      lines.push('');
+
+      if (scenario.optimizationReport.bottlenecks.length > 0) {
+        lines.push(
+          `**Bottleneck nodes:** ${scenario.optimizationReport.bottlenecks.map((b) => `\`${b.nodeId}\` (${((b.failureCount / b.visitCount) * 100).toFixed(0)}% fail)`).join(', ')}`,
+        );
+        lines.push('');
+      }
     }
   }
 

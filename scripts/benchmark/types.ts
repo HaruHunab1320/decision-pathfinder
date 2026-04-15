@@ -31,6 +31,8 @@ export interface OptimizationReport {
 export interface ScenarioResult {
   scenarioName: string;
   scenarioDescription: string;
+  phaseAModel: string;
+  phaseBModel: string;
   phaseA: RunResult[];
   phaseB: RunResult[];
   optimizationReport: OptimizationReport;
@@ -48,27 +50,37 @@ export interface AggregateMetrics {
   totalErrors: number;
 }
 
+export interface ModelConfig {
+  name: string;
+  modelId: string;
+}
+
 export interface BenchmarkConfig {
   runsPerPhase: number;
   interRunDelayMs: number;
   interScenarioDelayMs: number;
   overrideThreshold: number;
   biasThreshold: number;
+  phaseAModels: ModelConfig[];
+  phaseBModel: ModelConfig;
+}
+
+export interface ModelSummary {
+  phaseAModel: string;
+  phaseBModel: string;
+  phaseA: AggregateMetrics;
+  phaseB: AggregateMetrics;
+  improvement: {
+    successRate: string;
+    avgSteps: string;
+    avgDuration: string;
+    errorReduction: string;
+  };
 }
 
 export interface BenchmarkReport {
   timestamp: string;
-  model: string;
   config: BenchmarkConfig;
   scenarios: ScenarioResult[];
-  summary: {
-    phaseA: AggregateMetrics;
-    phaseB: AggregateMetrics;
-    improvement: {
-      successRate: string;
-      avgSteps: string;
-      avgDuration: string;
-      errorReduction: string;
-    };
-  };
+  modelSummaries: ModelSummary[];
 }

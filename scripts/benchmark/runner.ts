@@ -3,7 +3,14 @@ import { RecommendationEngine } from '../../src/recommendation/RecommendationEng
 import { TreeExecutor } from '../../src/execution/TreeExecutor.js';
 import { GeminiAdapter } from '../../src/adapters/GeminiAdapter.js';
 import { GuidedDecisionMaker } from './adapters/guided-decision-maker.js';
-import type { ScenarioDefinition, ScenarioResult, RunResult, OptimizationReport, BenchmarkConfig } from './types.js';
+import type {
+  ScenarioDefinition,
+  ScenarioResult,
+  RunResult,
+  OptimizationReport,
+  BenchmarkConfig,
+  ModelConfig,
+} from './types.js';
 import type { IDecisionMaker, ExecutionResult } from '../../src/execution/TreeExecutor.js';
 
 const STATUS_ICONS: Record<string, string> = {
@@ -13,28 +20,31 @@ const STATUS_ICONS: Record<string, string> = {
   max_steps_exceeded: 'MAX',
 };
 
-export async function runScenario(
+export async function runScenarioWithModel(
   scenario: ScenarioDefinition,
   scenarioIndex: number,
   totalScenarios: number,
+  phaseAModel: ModelConfig,
+  phaseBModel: ModelConfig,
   apiKey: string,
   config: BenchmarkConfig,
 ): Promise<ScenarioResult> {
-  console.log(`\n[${scenarioIndex + 1}/${totalScenarios}] ${scenario.name}`);
-  console.log(`  ${scenario.description}`);
+  console.log(
+    `\n  [${scenarioIndex + 1}/${totalScenarios}] ${scenario.name}`,
+  );
 
   const tracker = new PathTracker();
 
-  const geminiAdapter = new GeminiAdapter({
+  const phaseAAdapter = new GeminiAdapter({
     apiKey,
-    modelName: 'gemini-2.0-flash-lite',
+    modelName: phaseAModel.modelId,
     maxRetries: 4,
     retryDelayMs: 2000,
     maxOutputTokens: 100,
   });
 
-  // ── Phase A: Baseline ──
-  console.log('  Phase A (baseline):');
+  // ── Phase A: Teacher model builds history ──
+  console.log(`    Phase A (${phaseAModel.name}):`);
   const phaseARuns: RunResult[] = [];
   const phaseAStartSession = tracker.getAllSessions().length;
 
@@ -42,7 +52,7 @@ export async function runScenario(
     const result = await executeRun(
       scenario,
       tracker,
-      geminiAdapter,
+      phaseAAdapter,
       i,
       config.runsPerPhase,
       'A',
@@ -59,7 +69,6 @@ export async function runScenario(
   const report = engine.generateOptimizationReport();
   const bottlenecks = engine.identifyBottlenecks(0.3);
 
-  // Convert edgeRecommendations Map to serializable array
   const edgeRecsArray: OptimizationReport['edgeRecommendations'] = [];
   for (const [nodeId, rec] of report.edgeRecommendations) {
     edgeRecsArray.push({ nodeId, recommendation: rec });
@@ -71,12 +80,25 @@ export async function runScenario(
     edgeRecommendations: edgeRecsArray,
   };
 
-  console.log(`  Analysis: ${tracker.getAllSessions().length - phaseAStartSession} sessions, ${bottlenecks.length} bottleneck(s)`);
+  const phaseASuccesses = phaseARuns.filter(
+    (r) => r.executionResult.status === 'success',
+  ).length;
+  console.log(
+    `    Analysis: ${tracker.getAllSessions().length - phaseAStartSession} sessions, ${phaseASuccesses}/${config.runsPerPhase} success, ${bottlenecks.length} bottleneck(s)`,
+  );
 
-  // ── Phase B: Guided ──
-  console.log('  Phase B (guided):');
+  // ── Phase B: Student model uses teacher's recommendations ──
+  const phaseBAdapter = new GeminiAdapter({
+    apiKey,
+    modelName: phaseBModel.modelId,
+    maxRetries: 4,
+    retryDelayMs: 2000,
+    maxOutputTokens: 100,
+  });
+
+  console.log(`    Phase B (${phaseBModel.name} + guided):`);
   const guidedMaker = new GuidedDecisionMaker(
-    geminiAdapter,
+    phaseBAdapter,
     engine,
     config.overrideThreshold,
     config.biasThreshold,
@@ -105,6 +127,8 @@ export async function runScenario(
   return {
     scenarioName: scenario.name,
     scenarioDescription: scenario.description,
+    phaseAModel: phaseAModel.name,
+    phaseBModel: phaseBModel.name,
     phaseA: phaseARuns,
     phaseB: phaseBRuns,
     optimizationReport,
@@ -137,7 +161,6 @@ async function executeRun(
   try {
     executionResult = await executor.execute(scenario.startNodeId);
   } catch (err) {
-    // Shouldn't happen since executor catches errors, but just in case
     executionResult = {
       finalNodeId: scenario.startNodeId,
       finalNode: scenario.tree.getNode(scenario.startNodeId)!,
@@ -157,11 +180,12 @@ async function executeRun(
   const biasCount = guidedMaker?.biasCount ?? 0;
 
   const statusIcon = STATUS_ICONS[executionResult.status] ?? '?';
-  const guidedInfo = phase === 'B' && (overrideCount > 0 || biasCount > 0)
-    ? ` [${overrideCount} override, ${biasCount} bias]`
-    : '';
+  const guidedInfo =
+    phase === 'B' && (overrideCount > 0 || biasCount > 0)
+      ? ` [${overrideCount} override, ${biasCount} bias]`
+      : '';
   console.log(
-    `    Run ${runIndex + 1}/${totalRuns} -> ${statusIcon} (${executionResult.status}, ${executionResult.stepCount} steps, ${durationMs}ms)${guidedInfo}`,
+    `      Run ${runIndex + 1}/${totalRuns} -> ${statusIcon} (${executionResult.status}, ${executionResult.stepCount} steps, ${durationMs}ms)${guidedInfo}`,
   );
 
   return {
