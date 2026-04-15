@@ -21,7 +21,9 @@ export class GeminiAdapter implements IDecisionMaker {
     this.model = genAI.getGenerativeModel({
       model: config.modelName ?? 'gemini-2.0-flash-lite',
       generationConfig: {
-        maxOutputTokens: config.maxOutputTokens ?? 50,
+        ...(config.maxOutputTokens !== undefined
+          ? { maxOutputTokens: config.maxOutputTokens }
+          : {}),
         temperature: 0,
       },
     });

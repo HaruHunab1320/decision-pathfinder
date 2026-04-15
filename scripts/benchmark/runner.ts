@@ -40,7 +40,6 @@ export async function runScenarioWithModel(
     modelName: phaseAModel.modelId,
     maxRetries: 4,
     retryDelayMs: 2000,
-    maxOutputTokens: 100,
   });
 
   // ── Phase A: Teacher model builds history ──
@@ -93,7 +92,6 @@ export async function runScenarioWithModel(
     modelName: phaseBModel.modelId,
     maxRetries: 4,
     retryDelayMs: 2000,
-    maxOutputTokens: 100,
   });
 
   console.log(`    Phase B (${phaseBModel.name} + guided):`);
