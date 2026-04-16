@@ -1,0 +1,7 @@
+# Force GitHub Linguist to treat .ts files as TypeScript
+# (it otherwise misclassifies files with a Node shebang as JavaScript)
+*.ts linguist-language=TypeScript
+
+# Exclude lock files and generated artifacts from language stats
+package-lock.json linguist-generated=true
+dist/** linguist-generated=true
