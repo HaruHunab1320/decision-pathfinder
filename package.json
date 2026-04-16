@@ -27,7 +27,8 @@
   },
   "homepage": "https://github.com/HaruHunab1320/decision-pathfinder#readme",
   "scripts": {
-    "build": "tsc",
+    "clean": "rm -rf dist",
+    "build": "npm run clean && tsc",
     "test": "vitest run",
     "lint": "biome check",
     "lint:fix": "biome check --write",
