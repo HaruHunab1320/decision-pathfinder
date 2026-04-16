@@ -155,6 +155,59 @@ GEMINI_API_KEY=your-key npm run benchmark
 
 Cross-model mode tests knowledge transfer — a smarter model (Pro) teaches Flash Lite by establishing successful paths that get cached as overrides.
 
+## MCP Server
+
+decision-pathfinder includes an MCP server so Claude Code, Cursor, and other MCP clients can use decision trees directly.
+
+### Setup
+
+Add to your Claude Code config (`.claude/settings.json`):
+
+```json
+{
+  "mcpServers": {
+    "decision-pathfinder": {
+      "command": "npx",
+      "args": ["decision-pathfinder-mcp"],
+      "env": {
+        "GEMINI_API_KEY": "your-key"
+      }
+    }
+  }
+}
+```
+
+Or for Claude Desktop (`claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "decision-pathfinder": {
+      "command": "npx",
+      "args": ["decision-pathfinder-mcp"],
+      "env": {
+        "GEMINI_API_KEY": "your-key"
+      }
+    }
+  }
+}
+```
+
+### Available tools
+
+| Tool | Description |
+|------|-------------|
+| `dp_load_tree` | Load a tree from a JSON file or inline JSON |
+| `dp_list_trees` | List all loaded trees |
+| `dp_execute_tree` | Execute a tree (uses Gemini + recommendations automatically) |
+| `dp_get_recommendation` | Get edge recommendation at a node |
+| `dp_get_analytics` | Get execution analytics and bottleneck report |
+| `dp_export_tree` | Export a tree to JSON |
+
+The server runs locally on your machine. Trees, history, and recommendations stay local. Set `GEMINI_API_KEY` for LLM-powered decisions, or omit it to use the MockDecisionMaker (picks first available edge).
+
+Set `GEMINI_MODEL` to override the default model (e.g., `gemini-2.5-flash`).
+
 ## Scripts
 
 ```bash
