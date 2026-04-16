@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+
 /**
  * decision-pathfinder MCP server
  *
@@ -35,27 +36,26 @@
  *   ANTHROPIC_MODEL, OPENAI_MODEL, GEMINI_MODEL.
  */
 
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import * as fs from 'node:fs';
-import * as path from 'node:path';
-
+import { ClaudeAdapter } from '../adapters/ClaudeAdapter.js';
+import { GeminiAdapter } from '../adapters/GeminiAdapter.js';
+import { OpenAIAdapter } from '../adapters/OpenAIAdapter.js';
 import { DecisionTree } from '../core/DecisionTree.js';
+import type { IDecisionMaker } from '../execution/TreeExecutor.js';
+import { MockDecisionMaker, TreeExecutor } from '../execution/TreeExecutor.js';
+import { ConditionalNode } from '../nodes/ConditionalNode.js';
+import { ConversationNode } from '../nodes/ConversationNode.js';
+import { FailureNode } from '../nodes/FailureNode.js';
+import { SuccessNode } from '../nodes/SuccessNode.js';
+import { ToolCallNode } from '../nodes/ToolCallNode.js';
+import { PersistentPathTracker, SessionStore } from '../persistence/index.js';
+import { RecommendationEngine } from '../recommendation/RecommendationEngine.js';
 import { TreeSerializer } from '../serialization/TreeSerializer.js';
 import { PathTracker } from '../tracking/PathTracker.js';
-import { RecommendationEngine } from '../recommendation/RecommendationEngine.js';
-import { TreeExecutor, MockDecisionMaker } from '../execution/TreeExecutor.js';
-import { GeminiAdapter } from '../adapters/GeminiAdapter.js';
-import { ClaudeAdapter } from '../adapters/ClaudeAdapter.js';
-import { OpenAIAdapter } from '../adapters/OpenAIAdapter.js';
-import { ConversationNode } from '../nodes/ConversationNode.js';
-import { ToolCallNode } from '../nodes/ToolCallNode.js';
-import { ConditionalNode } from '../nodes/ConditionalNode.js';
-import { SuccessNode } from '../nodes/SuccessNode.js';
-import { FailureNode } from '../nodes/FailureNode.js';
-import { SessionStore, PersistentPathTracker } from '../persistence/index.js';
-import type { IDecisionMaker } from '../execution/TreeExecutor.js';
 
 // ─── State ────────────────────────────────────────────────────────────────────
 
@@ -83,7 +83,7 @@ const trees = new Map<string, TreeState>();
 const recordings = new Map<string, RecordingState>();
 const serializer = new TreeSerializer();
 const sessionStore = new SessionStore(
-  process.env['DECISION_PATHFINDER_STORE'] || undefined,
+  process.env.DECISION_PATHFINDER_STORE || undefined,
 );
 
 async function createPersistentTracker(treeId: string): Promise<{
@@ -109,13 +109,14 @@ interface SelectedProvider {
  * ANTHROPIC_MODEL, OPENAI_MODEL, GEMINI_MODEL).
  */
 function selectProvider(): SelectedProvider {
-  const anthropic = process.env['ANTHROPIC_API_KEY'];
-  const openai = process.env['OPENAI_API_KEY'];
-  const gemini = process.env['GEMINI_API_KEY'];
-  const override = process.env['DP_MODEL'];
+  const anthropic = process.env.ANTHROPIC_API_KEY;
+  const openai = process.env.OPENAI_API_KEY;
+  const gemini = process.env.GEMINI_API_KEY;
+  const override = process.env.DP_MODEL;
 
   if (anthropic) {
-    const modelName = override ?? process.env['ANTHROPIC_MODEL'] ?? 'claude-haiku-4-5';
+    const modelName =
+      override ?? process.env.ANTHROPIC_MODEL ?? 'claude-haiku-4-5';
     return {
       name: 'claude',
       adapter: new ClaudeAdapter({ apiKey: anthropic, modelName }),
@@ -123,7 +124,7 @@ function selectProvider(): SelectedProvider {
     };
   }
   if (openai) {
-    const modelName = override ?? process.env['OPENAI_MODEL'] ?? 'gpt-4o-mini';
+    const modelName = override ?? process.env.OPENAI_MODEL ?? 'gpt-4o-mini';
     return {
       name: 'openai',
       adapter: new OpenAIAdapter({ apiKey: openai, modelName }),
@@ -131,7 +132,8 @@ function selectProvider(): SelectedProvider {
     };
   }
   if (gemini) {
-    const modelName = override ?? process.env['GEMINI_MODEL'] ?? 'gemini-2.0-flash-lite';
+    const modelName =
+      override ?? process.env.GEMINI_MODEL ?? 'gemini-2.0-flash-lite';
     return {
       name: 'gemini',
       adapter: new GeminiAdapter({ apiKey: gemini, modelName }),
@@ -170,11 +172,16 @@ function getTree(treeId: string): TreeState {
 }
 
 function jsonResponse(data: unknown) {
-  return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
+  return {
+    content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }],
+  };
 }
 
 function errorResponse(msg: string) {
-  return { content: [{ type: 'text' as const, text: msg }], isError: true as const };
+  return {
+    content: [{ type: 'text' as const, text: msg }],
+    isError: true as const,
+  };
 }
 
 // ─── Server ───────────────────────────────────────────────────────────────────
@@ -193,12 +200,15 @@ server.registerTool(
     description:
       'Begin recording the current task as a decision tree. Call this BEFORE starting a multi-step task so each subsequent action can be captured. Returns a recordingId used with dp_record_step and dp_finalize_recording. Each step you take (tool call, decision, condition check) should be recorded so the tree can guide future executions of similar tasks.',
     inputSchema: {
-      taskName: z.string().describe(
-        'Short descriptive name for this task (e.g., "deploy-web-app", "fix-auth-bug")',
-      ),
-      description: z.string().optional().describe(
-        'Longer description of what this task accomplishes',
-      ),
+      taskName: z
+        .string()
+        .describe(
+          'Short descriptive name for this task (e.g., "deploy-web-app", "fix-auth-bug")',
+        ),
+      description: z
+        .string()
+        .optional()
+        .describe('Longer description of what this task accomplishes'),
     },
   },
   async (args) => {
@@ -242,17 +252,31 @@ server.registerTool(
     description:
       'Append a step to the recording. Use this after each meaningful action: tool calls, decisions made, conditions checked. The step is linked linearly to the previous step (use dp_record_branch for multi-way choices). Returns the new nodeId.',
     inputSchema: {
-      recordingId: z.string().describe('The recording ID from dp_start_recording'),
-      stepType: z.enum(['tool_call', 'conversation', 'conditional']).describe(
-        'Type of step: tool_call (you ran a tool), conversation (you made a reasoning decision), conditional (you checked a condition)',
-      ),
-      label: z.string().describe('Short human-readable label (e.g., "Check git status", "Parse user input")'),
-      details: z.record(z.string(), z.unknown()).optional().describe(
-        'Step-specific data: for tool_call use { toolName, parameters }; for conversation use { prompt }; for conditional use { condition }',
-      ),
-      edgeCondition: z.string().optional().describe(
-        'Description of WHY this step followed the previous one (the condition/reason). Helps future runs understand the path.',
-      ),
+      recordingId: z
+        .string()
+        .describe('The recording ID from dp_start_recording'),
+      stepType: z
+        .enum(['tool_call', 'conversation', 'conditional'])
+        .describe(
+          'Type of step: tool_call (you ran a tool), conversation (you made a reasoning decision), conditional (you checked a condition)',
+        ),
+      label: z
+        .string()
+        .describe(
+          'Short human-readable label (e.g., "Check git status", "Parse user input")',
+        ),
+      details: z
+        .record(z.string(), z.unknown())
+        .optional()
+        .describe(
+          'Step-specific data: for tool_call use { toolName, parameters }; for conversation use { prompt }; for conditional use { condition }',
+        ),
+      edgeCondition: z
+        .string()
+        .optional()
+        .describe(
+          'Description of WHY this step followed the previous one (the condition/reason). Helps future runs understand the path.',
+        ),
     },
   },
   async (args) => {
@@ -260,22 +284,22 @@ server.registerTool(
       const state = getRecording(args.recordingId);
       const nodeId = `node-${state.nodeCounter++}`;
 
-      let node;
+      let node: ToolCallNode | ConditionalNode | ConversationNode;
       if (args.stepType === 'tool_call') {
         const details = args.details ?? {};
         node = new ToolCallNode(nodeId, args.label, {
-          toolName: (details['toolName'] as string) ?? args.label,
-          parameters: (details['parameters'] as Record<string, unknown>) ?? {},
+          toolName: (details.toolName as string) ?? args.label,
+          parameters: (details.parameters as Record<string, unknown>) ?? {},
         });
       } else if (args.stepType === 'conditional') {
         const details = args.details ?? {};
         node = new ConditionalNode(nodeId, args.label, {
-          condition: (details['condition'] as string) ?? args.label,
+          condition: (details.condition as string) ?? args.label,
         });
       } else {
         const details = args.details ?? {};
         node = new ConversationNode(nodeId, args.label, {
-          prompt: (details['prompt'] as string) ?? args.label,
+          prompt: (details.prompt as string) ?? args.label,
         });
       }
 
@@ -319,10 +343,14 @@ server.registerTool(
       'Mark that at the previous step you had multiple options and chose one. This enriches the tree with alternatives that were considered, enabling better future recommendations. Provide the edge conditions (labels) for the options NOT taken — they become phantom edges that future runs can explore.',
     inputSchema: {
       recordingId: z.string().describe('The recording ID'),
-      chosenCondition: z.string().describe('Description of the option you chose'),
-      alternativesConsidered: z.array(z.string()).describe(
-        'Descriptions of other options you considered but did not take',
-      ),
+      chosenCondition: z
+        .string()
+        .describe('Description of the option you chose'),
+      alternativesConsidered: z
+        .array(z.string())
+        .describe(
+          'Descriptions of other options you considered but did not take',
+        ),
     },
   },
   async (args) => {
@@ -341,7 +369,7 @@ server.registerTool(
         return errorResponse(`Current node "${state.lastNodeId}" not found`);
       }
 
-      currentNode.metadata['branch'] = {
+      currentNode.metadata.branch = {
         chosen: args.chosenCondition,
         alternatives: args.alternativesConsidered,
       };
@@ -370,11 +398,16 @@ server.registerTool(
       'End the recording with a success or failure outcome. Optionally save the tree to a file so it can be loaded later and used to guide similar future tasks. The tree is also registered as a loaded tree (use dp_list_trees to see).',
     inputSchema: {
       recordingId: z.string().describe('The recording ID'),
-      outcome: z.enum(['success', 'failure']).describe('Final outcome of the task'),
+      outcome: z
+        .enum(['success', 'failure'])
+        .describe('Final outcome of the task'),
       outcomeMessage: z.string().describe('Description of the final outcome'),
-      savePath: z.string().optional().describe(
-        'File path to save the tree JSON. If omitted, the tree is kept in memory only.',
-      ),
+      savePath: z
+        .string()
+        .optional()
+        .describe(
+          'File path to save the tree JSON. If omitted, the tree is kept in memory only.',
+        ),
     },
   },
   async (args) => {
@@ -453,12 +486,15 @@ server.registerTool(
     description:
       'Load a decision tree from a JSON file path or inline JSON string. Returns the tree ID for use with other tools.',
     inputSchema: {
-      source: z.string().describe(
-        'Either a file path to a .json tree definition, or an inline JSON string of a serialized tree',
-      ),
-      treeId: z.string().optional().describe(
-        'Custom ID for this tree. Defaults to filename or "tree-N"',
-      ),
+      source: z
+        .string()
+        .describe(
+          'Either a file path to a .json tree definition, or an inline JSON string of a serialized tree',
+        ),
+      treeId: z
+        .string()
+        .optional()
+        .describe('Custom ID for this tree. Defaults to filename or "tree-N"'),
     },
   },
   async (args) => {
@@ -550,18 +586,25 @@ server.registerTool(
         return jsonResponse({
           treeId: args.treeId,
           hasHistory: false,
-          message: 'No prior sessions for this tree. This will be the first run.',
+          message:
+            'No prior sessions for this tree. This will be the first run.',
         });
       }
 
-      const successCount = persisted.filter((s) => s.finalStatus === 'success').length;
+      const successCount = persisted.filter(
+        (s) => s.finalStatus === 'success',
+      ).length;
       const failureCount = persisted.filter(
-        (s) => s.finalStatus === 'failure' || s.finalStatus === 'error' || s.finalStatus === 'max_steps_exceeded',
+        (s) =>
+          s.finalStatus === 'failure' ||
+          s.finalStatus === 'error' ||
+          s.finalStatus === 'max_steps_exceeded',
       ).length;
       const successLengths = persisted
         .filter((s) => s.finalStatus === 'success')
         .map((s) => s.stepCount);
-      const shortestSuccess = successLengths.length > 0 ? Math.min(...successLengths) : null;
+      const shortestSuccess =
+        successLengths.length > 0 ? Math.min(...successLengths) : null;
       const avgSuccess =
         successLengths.length > 0
           ? successLengths.reduce((a, b) => a + b, 0) / successLengths.length
@@ -577,7 +620,10 @@ server.registerTool(
         successRate: persisted.length > 0 ? successCount / persisted.length : 0,
         shortestSuccessfulSteps: shortestSuccess,
         averageSuccessfulSteps: avgSuccess,
-        mostRecentSession: persisted.length > 0 ? persisted[persisted.length - 1]!.timestamp : null,
+        mostRecentSession:
+          persisted.length > 0
+            ? persisted[persisted.length - 1]!.timestamp
+            : null,
       });
     } catch (err) {
       return errorResponse((err as Error).message);
@@ -595,15 +641,18 @@ server.registerTool(
       'Execute a loaded decision tree from a start node. Auto-selects an LLM provider based on available env vars (ANTHROPIC_API_KEY > OPENAI_API_KEY > GEMINI_API_KEY > mock). Automatically uses the recommendation engine if prior executions exist.',
     inputSchema: {
       treeId: z.string().describe('ID of the loaded tree'),
-      startNodeId: z.string().optional().describe(
-        'Node ID to start from. Defaults to first root node.',
-      ),
-      useRecommendations: z.boolean().optional().describe(
-        'Use recommendation engine for guidance. Default: true',
-      ),
-      maxSteps: z.number().optional().describe(
-        'Max execution steps. Default: 50',
-      ),
+      startNodeId: z
+        .string()
+        .optional()
+        .describe('Node ID to start from. Defaults to first root node.'),
+      useRecommendations: z
+        .boolean()
+        .optional()
+        .describe('Use recommendation engine for guidance. Default: true'),
+      maxSteps: z
+        .number()
+        .optional()
+        .describe('Max execution steps. Default: 50'),
     },
   },
   async (args) => {
@@ -790,7 +839,11 @@ server.registerTool(
       if (args.filePath) {
         const resolved = path.resolve(args.filePath);
         fs.writeFileSync(resolved, json, 'utf-8');
-        return jsonResponse({ exported: true, path: resolved, bytes: json.length });
+        return jsonResponse({
+          exported: true,
+          path: resolved,
+          bytes: json.length,
+        });
       }
 
       return { content: [{ type: 'text' as const, text: json }] };

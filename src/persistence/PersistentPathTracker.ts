@@ -1,6 +1,10 @@
-import { PathTracker } from '../tracking/PathTracker.js';
-import type { SessionStore, PersistedSession, FinalStatus } from './SessionStore.js';
 import type { EnhancedPathRecord } from '../core/interfaces.js';
+import { PathTracker } from '../tracking/PathTracker.js';
+import type {
+  FinalStatus,
+  PersistedSession,
+  SessionStore,
+} from './SessionStore.js';
 
 /**
  * A PathTracker that persists completed sessions to disk and replays prior

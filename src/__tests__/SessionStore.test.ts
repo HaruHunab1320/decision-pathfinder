@@ -1,20 +1,23 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { SessionStore } from '../persistence/SessionStore.js';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { PersistedSession } from '../persistence/SessionStore.js';
+import { SessionStore } from '../persistence/SessionStore.js';
 
 function tempDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'dp-test-'));
 }
 
-function makeSession(stepCount = 3, status: 'success' | 'failure' = 'success'): PersistedSession {
+function makeSession(
+  stepCount = 3,
+  status: 'success' | 'failure' = 'success',
+): PersistedSession {
   const records = Array.from({ length: stepCount }, (_, i) => ({
     nodeId: `n${i}`,
     timestamp: Date.now() + i,
     metadata: {},
-    status: i === stepCount - 1 ? status : 'pending' as const,
+    status: i === stepCount - 1 ? status : ('pending' as const),
   }));
   return {
     timestamp: new Date().toISOString(),
@@ -113,7 +116,10 @@ describe('SessionStore', () => {
   it('skips malformed lines rather than failing', async () => {
     const safeId = 'tree-1';
     const filePath = path.join(dir, `${safeId}.jsonl`);
-    fs.writeFileSync(filePath, 'not-json\n{"valid":true,"timestamp":"x","records":[],"finalStatus":"success","stepCount":0}\nalso-bad\n');
+    fs.writeFileSync(
+      filePath,
+      'not-json\n{"valid":true,"timestamp":"x","records":[],"finalStatus":"success","stepCount":0}\nalso-bad\n',
+    );
 
     const loaded = await store.load(safeId);
     expect(loaded).toHaveLength(1);

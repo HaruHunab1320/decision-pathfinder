@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { OpenAIAdapter } from '../adapters/OpenAIAdapter.js';
-import type { DecisionContext } from '../adapters/ILLMDecisionTreeAdapter.js';
+import type { DecisionContext } from '../adapters/types.js';
 import type { IEdge, INode } from '../core/interfaces.js';
 
 const mockCreate = vi.fn();
@@ -8,14 +8,18 @@ const mockCreate = vi.fn();
 vi.mock('openai', () => {
   return {
     default: class {
-      constructor(_config: { apiKey: string }) {}
       chat = { completions: { create: mockCreate } };
     },
   };
 });
 
 function makeContext(overrides?: Partial<DecisionContext>): DecisionContext {
-  const node: INode = { id: 'n1', type: 'conversation', label: 'Test', metadata: {} };
+  const node: INode = {
+    id: 'n1',
+    type: 'conversation',
+    label: 'Test',
+    metadata: {},
+  };
   const edges: IEdge[] = [
     { id: 'e1', sourceId: 'n1', targetId: 'n2', metadata: {} },
     { id: 'e2', sourceId: 'n1', targetId: 'n3', metadata: {} },

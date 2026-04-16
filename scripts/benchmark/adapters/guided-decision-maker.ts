@@ -1,4 +1,4 @@
-import type { DecisionContext } from '../../../src/adapters/ILLMDecisionTreeAdapter.js';
+import type { DecisionContext } from '../../../src/adapters/types.js';
 import type { IDecisionMaker } from '../../../src/execution/TreeExecutor.js';
 import type { RecommendationEngine } from '../../../src/recommendation/RecommendationEngine.js';
 

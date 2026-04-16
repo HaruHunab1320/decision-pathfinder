@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ClaudeAdapter } from '../adapters/ClaudeAdapter.js';
-import type { DecisionContext } from '../adapters/ILLMDecisionTreeAdapter.js';
+import type { DecisionContext } from '../adapters/types.js';
 import type { IEdge, INode } from '../core/interfaces.js';
 
 // Mock @anthropic-ai/sdk
@@ -9,14 +9,18 @@ const mockCreate = vi.fn();
 vi.mock('@anthropic-ai/sdk', () => {
   return {
     default: class {
-      constructor(_config: { apiKey: string }) {}
       messages = { create: mockCreate };
     },
   };
 });
 
 function makeContext(overrides?: Partial<DecisionContext>): DecisionContext {
-  const node: INode = { id: 'n1', type: 'conversation', label: 'Test', metadata: {} };
+  const node: INode = {
+    id: 'n1',
+    type: 'conversation',
+    label: 'Test',
+    metadata: {},
+  };
   const edges: IEdge[] = [
     { id: 'e1', sourceId: 'n1', targetId: 'n2', metadata: {} },
     { id: 'e2', sourceId: 'n1', targetId: 'n3', metadata: {} },

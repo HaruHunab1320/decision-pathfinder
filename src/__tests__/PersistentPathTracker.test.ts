@@ -1,14 +1,13 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { SessionStore } from '../persistence/SessionStore.js';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { PersistentPathTracker } from '../persistence/PersistentPathTracker.js';
+import { SessionStore } from '../persistence/SessionStore.js';
 
 function tempDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'dp-test-'));
 }
-
 
 describe('PersistentPathTracker', () => {
   let dir: string;

@@ -1,9 +1,14 @@
 import * as fs from 'node:fs';
-import * as path from 'node:path';
 import * as os from 'node:os';
+import * as path from 'node:path';
 import type { EnhancedPathRecord, VisitStatus } from '../core/interfaces.js';
 
-export type FinalStatus = 'success' | 'failure' | 'error' | 'max_steps_exceeded' | VisitStatus;
+export type FinalStatus =
+  | 'success'
+  | 'failure'
+  | 'error'
+  | 'max_steps_exceeded'
+  | VisitStatus;
 
 export interface PersistedSession {
   timestamp: string;
@@ -26,7 +31,8 @@ export class SessionStore {
   private storeDir: string;
 
   constructor(storeDir?: string) {
-    this.storeDir = storeDir ?? path.join(os.homedir(), '.decision-pathfinder', 'sessions');
+    this.storeDir =
+      storeDir ?? path.join(os.homedir(), '.decision-pathfinder', 'sessions');
     if (!fs.existsSync(this.storeDir)) {
       fs.mkdirSync(this.storeDir, { recursive: true });
     }

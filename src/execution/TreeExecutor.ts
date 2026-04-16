@@ -1,4 +1,4 @@
-import type { DecisionContext } from '../adapters/ILLMDecisionTreeAdapter.js';
+import type { DecisionContext } from '../adapters/types.js';
 import type {
   IDecisionTree,
   IEdge,

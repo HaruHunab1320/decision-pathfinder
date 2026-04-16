@@ -1,8 +1,8 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { DecisionTree } from '../core/DecisionTree.js';
-import { PathTracker } from '../tracking/PathTracker.js';
+import type { IEdge, INode } from '../core/interfaces.js';
 import { RecommendationEngine } from '../recommendation/RecommendationEngine.js';
-import type { INode, IEdge } from '../core/interfaces.js';
+import { PathTracker } from '../tracking/PathTracker.js';
 
 function node(id: string, label?: string): INode {
   return { id, type: 'test', label: label ?? id, metadata: {} };
@@ -24,10 +24,7 @@ function recordSession(
   tracker.startSession();
   for (let i = 0; i < nodeIds.length; i++) {
     const isLast = i === nodeIds.length - 1;
-    tracker.recordEnhancedVisit(
-      nodeIds[i]!,
-      isLast ? finalStatus : 'success',
-    );
+    tracker.recordEnhancedVisit(nodeIds[i]!, isLast ? finalStatus : 'success');
   }
   tracker.endSession();
 }
@@ -109,7 +106,11 @@ describe('RecommendationEngine — efficiency-weighted confidence', () => {
 
     // Record only long-path sessions first, then short-path to establish shortest=3
     for (let i = 0; i < 5; i++) {
-      recordSession(tracker, ['start', 'l1', 'l2', 'l3', 'l4', 'end'], 'success');
+      recordSession(
+        tracker,
+        ['start', 'l1', 'l2', 'l3', 'l4', 'end'],
+        'success',
+      );
     }
     for (let i = 0; i < 5; i++) {
       recordSession(tracker, ['start', 'short', 'end'], 'success');
@@ -122,7 +123,9 @@ describe('RecommendationEngine — efficiency-weighted confidence', () => {
     expect(rec!.recommendedEdgeId).toBe('e-start-short');
 
     // Get the alternative (long path) and verify its confidence is lower
-    const longAlt = rec!.alternativeEdges.find((a) => a.edgeId === 'e-start-l1');
+    const longAlt = rec!.alternativeEdges.find(
+      (a) => a.edgeId === 'e-start-l1',
+    );
     expect(longAlt).toBeDefined();
     expect(longAlt!.confidence).toBeLessThan(rec!.confidence);
   });

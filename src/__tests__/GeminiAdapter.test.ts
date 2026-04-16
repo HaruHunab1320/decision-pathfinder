@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { GeminiAdapterConfig } from '../adapters/GeminiAdapter.js';
 import { GeminiAdapter } from '../adapters/GeminiAdapter.js';
-import type { DecisionContext } from '../adapters/ILLMDecisionTreeAdapter.js';
+import type { DecisionContext } from '../adapters/types.js';
 import type { IEdge, INode } from '../core/interfaces.js';
 
 // Mock the @google/generative-ai module

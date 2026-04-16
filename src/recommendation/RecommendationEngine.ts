@@ -275,7 +275,10 @@ export class RecommendationEngine {
       const sampleFactor = Math.min(outcomes.total / 10, 1);
 
       let efficiencyFactor = 1;
-      if (outcomes.successfulLengths.length > 0 && shortestSuccessLength !== Number.POSITIVE_INFINITY) {
+      if (
+        outcomes.successfulLengths.length > 0 &&
+        shortestSuccessLength !== Number.POSITIVE_INFINITY
+      ) {
         const avgLen =
           outcomes.successfulLengths.reduce((a, b) => a + b, 0) /
           outcomes.successfulLengths.length;
