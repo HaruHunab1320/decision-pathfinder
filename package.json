@@ -52,6 +52,13 @@
   "author": "HaruHunab1320",
   "license": "ISC",
   "type": "module",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.86.1",
     "@google/generative-ai": "^0.24.0",
