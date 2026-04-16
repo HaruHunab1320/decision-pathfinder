@@ -34,9 +34,11 @@ Three things make the flywheel work:
 | Overridden decisions (high confidence) | No — skipped |
 
 `IDecisionMaker` is an interface. Ships with:
-- `GeminiAdapter` — uses Google Gemini (any model)
+- `ClaudeAdapter` — Anthropic Claude (defaults to `claude-haiku-4-5`)
+- `OpenAIAdapter` — OpenAI (defaults to `gpt-4o-mini`)
+- `GeminiAdapter` — Google Gemini (defaults to `gemini-2.0-flash-lite`)
 - `MockDecisionMaker` — picks the first available edge (deterministic, no LLM)
-- Your own implementation for OpenAI, Anthropic, local models, etc.
+- Your own implementation for local models or other providers.
 
 ## Install
 
@@ -90,17 +92,32 @@ const result = await executor.execute('start');
 // result.pathTaken === ['start', 'fetch', 'done']
 ```
 
-## Using with Gemini
+## LLM providers
+
+Pick whichever provider matches the key you already have:
 
 ```typescript
-import { GeminiAdapter } from 'decision-pathfinder';
+import { ClaudeAdapter, OpenAIAdapter, GeminiAdapter } from 'decision-pathfinder';
 
-const adapter = new GeminiAdapter({
-  apiKey: process.env.GEMINI_API_KEY!,
-  modelName: 'gemini-2.0-flash-lite',
+// Anthropic — cheap and fast decisions
+const claude = new ClaudeAdapter({
+  apiKey: process.env.ANTHROPIC_API_KEY!,
+  modelName: 'claude-haiku-4-5',  // default
 });
 
-const executor = new TreeExecutor(tree, adapter, tracker);
+// OpenAI
+const openai = new OpenAIAdapter({
+  apiKey: process.env.OPENAI_API_KEY!,
+  modelName: 'gpt-4o-mini',  // default
+});
+
+// Gemini
+const gemini = new GeminiAdapter({
+  apiKey: process.env.GEMINI_API_KEY!,
+  modelName: 'gemini-2.0-flash-lite',  // default
+});
+
+const executor = new TreeExecutor(tree, claude, tracker);
 ```
 
 ## Persistent learning
@@ -174,6 +191,21 @@ decision-pathfinder ships with an MCP server so Claude Code, Cursor, and other M
 
 ### Setup
 
+For most users, this is the entire config — no env block needed. The MCP server inherits env vars from its parent process, so any API key you already have exported (e.g. `ANTHROPIC_API_KEY` from your shell) gets picked up automatically:
+
+```json
+{
+  "mcpServers": {
+    "decision-pathfinder": {
+      "command": "npx",
+      "args": ["decision-pathfinder-mcp"]
+    }
+  }
+}
+```
+
+If you want to pin a specific provider or key:
+
 ```json
 {
   "mcpServers": {
@@ -181,20 +213,36 @@ decision-pathfinder ships with an MCP server so Claude Code, Cursor, and other M
       "command": "npx",
       "args": ["decision-pathfinder-mcp"],
       "env": {
-        "GEMINI_API_KEY": "your-key"
+        "ANTHROPIC_API_KEY": "sk-ant-...",
+        "ANTHROPIC_MODEL": "claude-haiku-4-5"
       }
     }
   }
 }
 ```
 
+### Provider auto-detection
+
+The server checks env vars in priority order and uses the first one it finds:
+
+| Priority | Env var | Provider | Default model |
+|----------|---------|----------|---------------|
+| 1 | `ANTHROPIC_API_KEY` | Claude | `claude-haiku-4-5` |
+| 2 | `OPENAI_API_KEY` | OpenAI | `gpt-4o-mini` |
+| 3 | `GEMINI_API_KEY` | Gemini | `gemini-2.0-flash-lite` |
+| 4 | (none) | Mock (picks first edge) | — |
+
+Override the model per-provider (`ANTHROPIC_MODEL`, `OPENAI_MODEL`, `GEMINI_MODEL`) or globally (`DP_MODEL`).
+
 ### Two LLMs at once
 
 When you use the MCP server from Claude Code:
 - **Claude** is the agent — it calls MCP tools and drives your session
-- **Gemini** is used inside `dp_execute_tree` for branch-point decisions
+- **The auto-detected provider** is used inside `dp_execute_tree` for branch-point decisions
 
-This is an economic choice — Claude is expensive, Gemini Flash Lite is cheap, and tree traversal is a high-volume, low-complexity task. Omit `GEMINI_API_KEY` to fall back to `MockDecisionMaker` (deterministic first-edge picker). Set `GEMINI_MODEL` to pick a different Gemini model (e.g., `gemini-2.5-flash`).
+This is an economic choice — the calling agent is typically powerful/expensive, but tree traversal is a high-volume low-complexity task where a cheap/fast model is plenty. If the user is already on Anthropic, Claude Haiku handles branch decisions for pennies. Same key, right-sized model.
+
+Future: when MCP clients (Claude Code, Cursor, Codex CLI) add sampling support, the server will use `sampling/createMessage` to delegate decisions to the host's LLM — eliminating the need for any env vars at all.
 
 ### Available tools
 
@@ -255,7 +303,7 @@ Everything runs locally. Trees, history, and recommendations stay on your machin
 
 ```bash
 npm run build      # compile to dist/
-npm run test       # 151 tests
+npm run test       # 166 tests
 npm run lint       # biome check
 npm run demo       # tree-driven README generator using Gemini
 npm run benchmark  # cross-model benchmark harness (flash-lite vs flash vs pro)

@@ -24,6 +24,15 @@
  * Session persistence: Completed executions are appended to JSONL files at
  * ~/.decision-pathfinder/sessions/{treeId}.jsonl, so recommendations
  * accumulate across process restarts.
+ *
+ * LLM provider auto-detection: checks env vars in priority order
+ *   ANTHROPIC_API_KEY → Claude (claude-haiku-4-5)
+ *   OPENAI_API_KEY    → OpenAI (gpt-4o-mini)
+ *   GEMINI_API_KEY    → Gemini (gemini-2.0-flash-lite)
+ *   none              → MockDecisionMaker (picks first edge)
+ *
+ * Override model with DP_MODEL (all providers) or provider-specific vars:
+ *   ANTHROPIC_MODEL, OPENAI_MODEL, GEMINI_MODEL.
  */
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -38,6 +47,8 @@ import { PathTracker } from '../tracking/PathTracker.js';
 import { RecommendationEngine } from '../recommendation/RecommendationEngine.js';
 import { TreeExecutor, MockDecisionMaker } from '../execution/TreeExecutor.js';
 import { GeminiAdapter } from '../adapters/GeminiAdapter.js';
+import { ClaudeAdapter } from '../adapters/ClaudeAdapter.js';
+import { OpenAIAdapter } from '../adapters/OpenAIAdapter.js';
 import { ConversationNode } from '../nodes/ConversationNode.js';
 import { ToolCallNode } from '../nodes/ToolCallNode.js';
 import { ConditionalNode } from '../nodes/ConditionalNode.js';
@@ -82,6 +93,52 @@ async function createPersistentTracker(treeId: string): Promise<{
   const tracker = new PersistentPathTracker(sessionStore, treeId);
   await tracker.initialize();
   return { tracker, priorSessions: tracker.getPriorSessionCount() };
+}
+
+interface SelectedProvider {
+  name: 'claude' | 'openai' | 'gemini' | 'mock';
+  adapter: IDecisionMaker;
+  modelName?: string;
+}
+
+/**
+ * Select an LLM provider based on which API keys are present in the environment.
+ * Priority: ANTHROPIC_API_KEY > OPENAI_API_KEY > GEMINI_API_KEY > mock.
+ *
+ * Model can be overridden with DP_MODEL env var (or provider-specific vars:
+ * ANTHROPIC_MODEL, OPENAI_MODEL, GEMINI_MODEL).
+ */
+function selectProvider(): SelectedProvider {
+  const anthropic = process.env['ANTHROPIC_API_KEY'];
+  const openai = process.env['OPENAI_API_KEY'];
+  const gemini = process.env['GEMINI_API_KEY'];
+  const override = process.env['DP_MODEL'];
+
+  if (anthropic) {
+    const modelName = override ?? process.env['ANTHROPIC_MODEL'] ?? 'claude-haiku-4-5';
+    return {
+      name: 'claude',
+      adapter: new ClaudeAdapter({ apiKey: anthropic, modelName }),
+      modelName,
+    };
+  }
+  if (openai) {
+    const modelName = override ?? process.env['OPENAI_MODEL'] ?? 'gpt-4o-mini';
+    return {
+      name: 'openai',
+      adapter: new OpenAIAdapter({ apiKey: openai, modelName }),
+      modelName,
+    };
+  }
+  if (gemini) {
+    const modelName = override ?? process.env['GEMINI_MODEL'] ?? 'gemini-2.0-flash-lite';
+    return {
+      name: 'gemini',
+      adapter: new GeminiAdapter({ apiKey: gemini, modelName }),
+      modelName,
+    };
+  }
+  return { name: 'mock', adapter: new MockDecisionMaker() };
 }
 
 function getRecording(recordingId: string): RecordingState {
@@ -535,7 +592,7 @@ server.registerTool(
   {
     title: 'Execute Decision Tree',
     description:
-      'Execute a loaded decision tree from a start node. Uses Gemini if GEMINI_API_KEY is set, otherwise uses MockDecisionMaker. Automatically uses recommendation engine if prior executions exist.',
+      'Execute a loaded decision tree from a start node. Auto-selects an LLM provider based on available env vars (ANTHROPIC_API_KEY > OPENAI_API_KEY > GEMINI_API_KEY > mock). Automatically uses the recommendation engine if prior executions exist.',
     inputSchema: {
       treeId: z.string().describe('ID of the loaded tree'),
       startNodeId: z.string().optional().describe(
@@ -559,47 +616,46 @@ server.registerTool(
         return errorResponse('Tree has no root nodes');
       }
 
-      // Build decision maker
-      let decisionMaker: IDecisionMaker;
-      const apiKey = process.env['GEMINI_API_KEY'];
+      // Auto-select provider + wrap in recommendation-guided decision maker
+      const provider = selectProvider();
+      let decisionMaker: IDecisionMaker = provider.adapter;
 
-      if (apiKey) {
-        const adapter = new GeminiAdapter({
-          apiKey,
-          modelName: process.env['GEMINI_MODEL'] ?? 'gemini-2.0-flash-lite',
-        });
-
-        if (args.useRecommendations !== false && tracker.getAllSessions().length > 0) {
-          const engine = new RecommendationEngine(tree, tracker);
-          decisionMaker = {
-            async decide(context) {
-              const rec = engine.getEdgeRecommendation(context.currentNodeId);
-              if (rec && rec.confidence >= 0.6) {
-                const valid = context.availableEdges.some((e) => e.id === rec.recommendedEdgeId);
-                if (valid) {
-                  return {
-                    chosenEdgeId: rec.recommendedEdgeId,
-                    reasoning: `Override (confidence: ${(rec.confidence * 100).toFixed(0)}%)`,
-                  };
-                }
+      if (
+        provider.name !== 'mock' &&
+        args.useRecommendations !== false &&
+        tracker.getAllSessions().length > 0
+      ) {
+        const engine = new RecommendationEngine(tree, tracker);
+        const inner = provider.adapter;
+        decisionMaker = {
+          async decide(context) {
+            const rec = engine.getEdgeRecommendation(context.currentNodeId);
+            if (rec && rec.confidence >= 0.6) {
+              const valid = context.availableEdges.some(
+                (e) => e.id === rec.recommendedEdgeId,
+              );
+              if (valid) {
+                return {
+                  chosenEdgeId: rec.recommendedEdgeId,
+                  reasoning: `Override (confidence: ${(rec.confidence * 100).toFixed(0)}%)`,
+                };
               }
-              if (rec && rec.confidence >= 0.2) {
-                return adapter.decide({
-                  ...context,
-                  metadata: {
-                    ...context.metadata,
-                    recommendation: { suggestedEdgeId: rec.recommendedEdgeId, confidence: rec.confidence },
+            }
+            if (rec && rec.confidence >= 0.2) {
+              return inner.decide({
+                ...context,
+                metadata: {
+                  ...context.metadata,
+                  recommendation: {
+                    suggestedEdgeId: rec.recommendedEdgeId,
+                    confidence: rec.confidence,
                   },
-                });
-              }
-              return adapter.decide(context);
-            },
-          };
-        } else {
-          decisionMaker = adapter;
-        }
-      } else {
-        decisionMaker = new MockDecisionMaker();
+                },
+              });
+            }
+            return inner.decide(context);
+          },
+        };
       }
 
       const executor = new TreeExecutor(tree, decisionMaker, tracker, {
@@ -617,6 +673,8 @@ server.registerTool(
         variables: result.variables,
         error: result.error,
         totalSessions: tracker.getAllSessions().length,
+        provider: provider.name,
+        model: provider.modelName,
       });
     } catch (err) {
       return errorResponse(`Execution failed: ${(err as Error).message}`);
