@@ -42,19 +42,35 @@ export async function runScenarioWithModel(
     retryDelayMs: 2000,
   });
 
-  // ── Phase A: Teacher model builds history ──
+  // ── Phase A: Teacher model builds initial history ──
+  // Each run rebuilds the engine so later Phase A runs also benefit from earlier ones
   console.log(`    Phase A (${phaseAModel.name}):`);
   const phaseARuns: RunResult[] = [];
-  const phaseAStartSession = tracker.getAllSessions().length;
 
   for (let i = 0; i < config.runsPerPhase; i++) {
+    // Rebuild engine from all data so far (even Phase A benefits from its own history)
+    let decisionMaker: IDecisionMaker = phaseAAdapter;
+    let guidedMaker: GuidedDecisionMaker | undefined;
+
+    if (i > 0) {
+      const engine = new RecommendationEngine(scenario.tree, tracker);
+      guidedMaker = new GuidedDecisionMaker(
+        phaseAAdapter,
+        engine,
+        config.overrideThreshold,
+        config.biasThreshold,
+      );
+      decisionMaker = guidedMaker;
+    }
+
     const result = await executeRun(
       scenario,
       tracker,
-      phaseAAdapter,
+      decisionMaker,
       i,
       config.runsPerPhase,
       'A',
+      guidedMaker,
     );
     phaseARuns.push(result);
 
@@ -63,7 +79,7 @@ export async function runScenarioWithModel(
     }
   }
 
-  // ── Build recommendation engine from Phase A data ──
+  // ── Snapshot the recommendation state between phases ──
   const engine = new RecommendationEngine(scenario.tree, tracker);
   const report = engine.generateOptimizationReport();
   const bottlenecks = engine.identifyBottlenecks(0.3);
@@ -83,10 +99,11 @@ export async function runScenarioWithModel(
     (r) => r.executionResult.status === 'success',
   ).length;
   console.log(
-    `    Analysis: ${tracker.getAllSessions().length - phaseAStartSession} sessions, ${phaseASuccesses}/${config.runsPerPhase} success, ${bottlenecks.length} bottleneck(s)`,
+    `    Analysis: ${tracker.getAllSessions().length} sessions, ${phaseASuccesses}/${config.runsPerPhase} success, ${bottlenecks.length} bottleneck(s)`,
   );
 
-  // ── Phase B: Student model uses teacher's recommendations ──
+  // ── Phase B: Student model with iterative learning ──
+  // Engine is rebuilt after EVERY run so each subsequent run benefits from all prior data
   const phaseBAdapter = new GeminiAdapter({
     apiKey,
     modelName: phaseBModel.modelId,
@@ -94,18 +111,19 @@ export async function runScenarioWithModel(
     retryDelayMs: 2000,
   });
 
-  console.log(`    Phase B (${phaseBModel.name} + guided):`);
-  const guidedMaker = new GuidedDecisionMaker(
-    phaseBAdapter,
-    engine,
-    config.overrideThreshold,
-    config.biasThreshold,
-  );
-
+  console.log(`    Phase B (${phaseBModel.name} + iterative guided):`);
   const phaseBRuns: RunResult[] = [];
 
   for (let i = 0; i < config.runsPerPhase; i++) {
-    guidedMaker.resetCounters();
+    // Rebuild engine from ALL accumulated data (Phase A + Phase B so far)
+    const iterEngine = new RecommendationEngine(scenario.tree, tracker);
+    const guidedMaker = new GuidedDecisionMaker(
+      phaseBAdapter,
+      iterEngine,
+      config.overrideThreshold,
+      config.biasThreshold,
+    );
+
     const result = await executeRun(
       scenario,
       tracker,
@@ -177,13 +195,39 @@ async function executeRun(
   const overrideCount = guidedMaker?.overrideCount ?? 0;
   const biasCount = guidedMaker?.biasCount ?? 0;
 
+  // Compute cumulative metrics at this point in time
+  const totalSessions = sessions.length;
+  const successfulSessions = sessions.filter((s) =>
+    s.some((r) => r.status === 'success'),
+  ).length;
+  const cumulativeSuccessRate =
+    totalSessions > 0 ? successfulSessions / totalSessions : 0;
+
+  // Get max confidence from current engine state
+  let maxConfidence = 0;
+  if (guidedMaker) {
+    const eng = new RecommendationEngine(scenario.tree, tracker);
+    const visited = new Set<string>();
+    for (const session of sessions) {
+      for (const rec of session) {
+        visited.add(rec.nodeId);
+      }
+    }
+    for (const nodeId of visited) {
+      const edgeRec = eng.getEdgeRecommendation(nodeId);
+      if (edgeRec && edgeRec.confidence > maxConfidence) {
+        maxConfidence = edgeRec.confidence;
+      }
+    }
+  }
+
   const statusIcon = STATUS_ICONS[executionResult.status] ?? '?';
   const guidedInfo =
-    phase === 'B' && (overrideCount > 0 || biasCount > 0)
-      ? ` [${overrideCount} override, ${biasCount} bias]`
+    overrideCount > 0 || biasCount > 0
+      ? ` [${overrideCount}ovr ${biasCount}bias conf:${(maxConfidence * 100).toFixed(0)}%]`
       : '';
   console.log(
-    `      Run ${runIndex + 1}/${totalRuns} -> ${statusIcon} (${executionResult.status}, ${executionResult.stepCount} steps, ${durationMs}ms)${guidedInfo}`,
+    `      Run ${runIndex + 1}/${totalRuns} -> ${statusIcon} (${executionResult.status}, ${executionResult.stepCount} steps, ${durationMs}ms) cum:${(cumulativeSuccessRate * 100).toFixed(0)}%${guidedInfo}`,
   );
 
   return {
@@ -194,6 +238,9 @@ async function executeRun(
     durationMs,
     overrideCount,
     biasCount,
+    cumulativeSuccessRate,
+    cumulativeSessions: totalSessions,
+    maxConfidence,
   };
 }
 

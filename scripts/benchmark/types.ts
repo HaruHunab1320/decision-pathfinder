@@ -20,6 +20,10 @@ export interface RunResult {
   durationMs: number;
   overrideCount: number;
   biasCount: number;
+  // Cumulative metrics at time of this run (for tracking progression)
+  cumulativeSuccessRate: number;
+  cumulativeSessions: number;
+  maxConfidence: number;
 }
 
 export interface OptimizationReport {

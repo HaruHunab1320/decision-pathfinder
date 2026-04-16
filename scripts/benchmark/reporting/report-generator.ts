@@ -177,13 +177,27 @@ export function generateMarkdown(report: BenchmarkReport): string {
       }
       lines.push('');
 
-      // Run details
-      lines.push('<details><summary>Run details</summary>');
+      // Learning progression table
+      const allRuns = [...scenario.phaseA, ...scenario.phaseB];
+      lines.push('**Learning Progression:**');
       lines.push('');
-      for (const run of [...scenario.phaseA, ...scenario.phaseB]) {
+      lines.push('| Run | Phase | Result | Steps | Duration | Cum. Success | Confidence | Overrides | Bias |');
+      lines.push('|-----|-------|--------|-------|----------|-------------|------------|-----------|------|');
+      for (const run of allRuns) {
         const r = run.executionResult;
         lines.push(
-          `- Phase ${run.phase} Run ${run.runIndex + 1}: **${r.status}** (${r.stepCount} steps, ${run.durationMs}ms) path: \`${r.pathTaken.join(' -> ')}\``,
+          `| ${run.phase}${run.runIndex + 1} | ${run.phase} | ${r.status} | ${r.stepCount} | ${run.durationMs}ms | ${(run.cumulativeSuccessRate * 100).toFixed(0)}% | ${(run.maxConfidence * 100).toFixed(0)}% | ${run.overrideCount} | ${run.biasCount} |`,
+        );
+      }
+      lines.push('');
+
+      // Run path details
+      lines.push('<details><summary>Path details</summary>');
+      lines.push('');
+      for (const run of allRuns) {
+        const r = run.executionResult;
+        lines.push(
+          `- ${run.phase}${run.runIndex + 1}: \`${r.pathTaken.join(' -> ')}\``,
         );
       }
       lines.push('');
