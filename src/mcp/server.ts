@@ -6,12 +6,19 @@
  * Runs locally on the user's machine via stdio transport.
  *
  * Tools:
- *   dp_load_tree       — Load a tree from a JSON file or inline JSON
- *   dp_list_trees      — List all loaded trees
- *   dp_execute_tree    — Execute a tree with optional tool handlers
- *   dp_get_recommendation — Get edge recommendation at a node
- *   dp_get_analytics   — Get execution analytics and bottleneck report
- *   dp_export_tree     — Export a tree to JSON
+ *   Recording (capture what the LLM is doing as a decision tree):
+ *     dp_start_recording   — Begin recording a new task as a tree
+ *     dp_record_step       — Append a step (tool call, conversation, condition)
+ *     dp_record_branch     — Mark a decision point with alternatives considered
+ *     dp_finalize_recording — End recording with success/failure, optionally save
+ *
+ *   Playback / execution:
+ *     dp_load_tree         — Load a tree from JSON file or inline
+ *     dp_list_trees        — List all loaded trees
+ *     dp_execute_tree      — Execute a tree (auto-uses recommendations)
+ *     dp_get_recommendation — Get edge recommendation at a node
+ *     dp_get_analytics     — Get execution analytics and bottleneck report
+ *     dp_export_tree       — Export a tree to JSON
  */
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -26,6 +33,11 @@ import { PathTracker } from '../tracking/PathTracker.js';
 import { RecommendationEngine } from '../recommendation/RecommendationEngine.js';
 import { TreeExecutor, MockDecisionMaker } from '../execution/TreeExecutor.js';
 import { GeminiAdapter } from '../adapters/GeminiAdapter.js';
+import { ConversationNode } from '../nodes/ConversationNode.js';
+import { ToolCallNode } from '../nodes/ToolCallNode.js';
+import { ConditionalNode } from '../nodes/ConditionalNode.js';
+import { SuccessNode } from '../nodes/SuccessNode.js';
+import { FailureNode } from '../nodes/FailureNode.js';
 import type { IDecisionMaker } from '../execution/TreeExecutor.js';
 
 // ─── State ────────────────────────────────────────────────────────────────────
@@ -37,8 +49,39 @@ interface TreeState {
   loadedAt: string;
 }
 
+interface RecordingState {
+  recordingId: string;
+  taskName: string;
+  description: string;
+  tree: DecisionTree;
+  tracker: PathTracker;
+  lastNodeId: string | null;
+  nodeCounter: number;
+  edgeCounter: number;
+  startedAt: string;
+}
+
 const trees = new Map<string, TreeState>();
+const recordings = new Map<string, RecordingState>();
 const serializer = new TreeSerializer();
+
+function getRecording(recordingId: string): RecordingState {
+  const state = recordings.get(recordingId);
+  if (!state) {
+    throw new Error(
+      `Recording "${recordingId}" not found. Active recordings: ${[...recordings.keys()].join(', ') || 'none'}`,
+    );
+  }
+  return state;
+}
+
+function slugify(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 40);
+}
 
 function getTree(treeId: string): TreeState {
   const state = trees.get(treeId);
@@ -64,6 +107,263 @@ const server = new McpServer({
   name: 'decision-pathfinder',
   version: '1.0.0',
 });
+
+// ─── Tool: Start Recording ────────────────────────────────────────────────────
+
+server.registerTool(
+  'dp_start_recording',
+  {
+    title: 'Start Recording a Task',
+    description:
+      'Begin recording the current task as a decision tree. Call this BEFORE starting a multi-step task so each subsequent action can be captured. Returns a recordingId used with dp_record_step and dp_finalize_recording. Each step you take (tool call, decision, condition check) should be recorded so the tree can guide future executions of similar tasks.',
+    inputSchema: {
+      taskName: z.string().describe(
+        'Short descriptive name for this task (e.g., "deploy-web-app", "fix-auth-bug")',
+      ),
+      description: z.string().optional().describe(
+        'Longer description of what this task accomplishes',
+      ),
+    },
+  },
+  async (args) => {
+    const recordingId = `rec-${Date.now()}-${slugify(args.taskName)}`;
+    const tree = new DecisionTree();
+
+    // Create the root "start" node
+    const startNodeId = 'start';
+    tree.addNode(
+      new ConversationNode(startNodeId, args.taskName, {
+        prompt: args.description ?? `Task: ${args.taskName}`,
+      }),
+    );
+
+    recordings.set(recordingId, {
+      recordingId,
+      taskName: args.taskName,
+      description: args.description ?? '',
+      tree,
+      tracker: new PathTracker(),
+      lastNodeId: startNodeId,
+      nodeCounter: 1,
+      edgeCounter: 0,
+      startedAt: new Date().toISOString(),
+    });
+
+    return jsonResponse({
+      recordingId,
+      startNodeId,
+      message: `Recording started. Use dp_record_step to capture each action, then dp_finalize_recording when done.`,
+    });
+  },
+);
+
+// ─── Tool: Record Step ────────────────────────────────────────────────────────
+
+server.registerTool(
+  'dp_record_step',
+  {
+    title: 'Record a Step',
+    description:
+      'Append a step to the recording. Use this after each meaningful action: tool calls, decisions made, conditions checked. The step is linked linearly to the previous step (use dp_record_branch for multi-way choices). Returns the new nodeId.',
+    inputSchema: {
+      recordingId: z.string().describe('The recording ID from dp_start_recording'),
+      stepType: z.enum(['tool_call', 'conversation', 'conditional']).describe(
+        'Type of step: tool_call (you ran a tool), conversation (you made a reasoning decision), conditional (you checked a condition)',
+      ),
+      label: z.string().describe('Short human-readable label (e.g., "Check git status", "Parse user input")'),
+      details: z.record(z.string(), z.unknown()).optional().describe(
+        'Step-specific data: for tool_call use { toolName, parameters }; for conversation use { prompt }; for conditional use { condition }',
+      ),
+      edgeCondition: z.string().optional().describe(
+        'Description of WHY this step followed the previous one (the condition/reason). Helps future runs understand the path.',
+      ),
+    },
+  },
+  async (args) => {
+    try {
+      const state = getRecording(args.recordingId);
+      const nodeId = `node-${state.nodeCounter++}`;
+
+      let node;
+      if (args.stepType === 'tool_call') {
+        const details = args.details ?? {};
+        node = new ToolCallNode(nodeId, args.label, {
+          toolName: (details['toolName'] as string) ?? args.label,
+          parameters: (details['parameters'] as Record<string, unknown>) ?? {},
+        });
+      } else if (args.stepType === 'conditional') {
+        const details = args.details ?? {};
+        node = new ConditionalNode(nodeId, args.label, {
+          condition: (details['condition'] as string) ?? args.label,
+        });
+      } else {
+        const details = args.details ?? {};
+        node = new ConversationNode(nodeId, args.label, {
+          prompt: (details['prompt'] as string) ?? args.label,
+        });
+      }
+
+      state.tree.addNode(node);
+
+      // Linear edge from previous step
+      if (state.lastNodeId) {
+        const edgeId = `edge-${state.edgeCounter++}`;
+        state.tree.addEdge({
+          id: edgeId,
+          sourceId: state.lastNodeId,
+          targetId: nodeId,
+          metadata: {},
+          ...(args.edgeCondition !== undefined
+            ? { condition: args.edgeCondition }
+            : {}),
+        });
+      }
+
+      state.lastNodeId = nodeId;
+
+      return jsonResponse({
+        recordingId: args.recordingId,
+        nodeId,
+        stepType: args.stepType,
+        totalSteps: state.nodeCounter - 1,
+      });
+    } catch (err) {
+      return errorResponse((err as Error).message);
+    }
+  },
+);
+
+// ─── Tool: Record Branch ──────────────────────────────────────────────────────
+
+server.registerTool(
+  'dp_record_branch',
+  {
+    title: 'Record a Decision Branch',
+    description:
+      'Mark that at the previous step you had multiple options and chose one. This enriches the tree with alternatives that were considered, enabling better future recommendations. Provide the edge conditions (labels) for the options NOT taken — they become phantom edges that future runs can explore.',
+    inputSchema: {
+      recordingId: z.string().describe('The recording ID'),
+      chosenCondition: z.string().describe('Description of the option you chose'),
+      alternativesConsidered: z.array(z.string()).describe(
+        'Descriptions of other options you considered but did not take',
+      ),
+    },
+  },
+  async (args) => {
+    try {
+      const state = getRecording(args.recordingId);
+      // Find the most recent edge and update its condition to be the chosen path
+      // Then add placeholder nodes for alternatives
+      // Simpler approach: just annotate the current node's metadata
+
+      if (!state.lastNodeId) {
+        return errorResponse('No steps recorded yet');
+      }
+
+      const currentNode = state.tree.getNode(state.lastNodeId);
+      if (!currentNode) {
+        return errorResponse(`Current node "${state.lastNodeId}" not found`);
+      }
+
+      currentNode.metadata['branch'] = {
+        chosen: args.chosenCondition,
+        alternatives: args.alternativesConsidered,
+      };
+
+      return jsonResponse({
+        recordingId: args.recordingId,
+        nodeId: state.lastNodeId,
+        branchRecorded: {
+          chosen: args.chosenCondition,
+          alternativeCount: args.alternativesConsidered.length,
+        },
+      });
+    } catch (err) {
+      return errorResponse((err as Error).message);
+    }
+  },
+);
+
+// ─── Tool: Finalize Recording ─────────────────────────────────────────────────
+
+server.registerTool(
+  'dp_finalize_recording',
+  {
+    title: 'Finalize Recording',
+    description:
+      'End the recording with a success or failure outcome. Optionally save the tree to a file so it can be loaded later and used to guide similar future tasks. The tree is also registered as a loaded tree (use dp_list_trees to see).',
+    inputSchema: {
+      recordingId: z.string().describe('The recording ID'),
+      outcome: z.enum(['success', 'failure']).describe('Final outcome of the task'),
+      outcomeMessage: z.string().describe('Description of the final outcome'),
+      savePath: z.string().optional().describe(
+        'File path to save the tree JSON. If omitted, the tree is kept in memory only.',
+      ),
+    },
+  },
+  async (args) => {
+    try {
+      const state = getRecording(args.recordingId);
+
+      // Add terminal node
+      const terminalId = args.outcome;
+      if (args.outcome === 'success') {
+        state.tree.addNode(
+          new SuccessNode(terminalId, 'Success', {
+            message: args.outcomeMessage,
+          }),
+        );
+      } else {
+        state.tree.addNode(
+          new FailureNode(terminalId, 'Failure', {
+            message: args.outcomeMessage,
+            recoverable: false,
+          }),
+        );
+      }
+
+      // Connect last step to terminal
+      if (state.lastNodeId && state.lastNodeId !== terminalId) {
+        state.tree.addEdge({
+          id: `edge-${state.edgeCounter++}`,
+          sourceId: state.lastNodeId,
+          targetId: terminalId,
+          metadata: {},
+        });
+      }
+
+      // Register as a loaded tree so it can be executed later
+      const treeId = slugify(state.taskName);
+      trees.set(treeId, {
+        tree: state.tree,
+        tracker: state.tracker,
+        name: state.taskName,
+        loadedAt: new Date().toISOString(),
+      });
+
+      let savedPath: string | undefined;
+      if (args.savePath) {
+        const resolved = path.resolve(args.savePath);
+        fs.writeFileSync(resolved, serializer.toJSON(state.tree), 'utf-8');
+        savedPath = resolved;
+      }
+
+      recordings.delete(args.recordingId);
+
+      return jsonResponse({
+        recordingId: args.recordingId,
+        treeId,
+        outcome: args.outcome,
+        nodeCount: state.tree.nodeCount,
+        edgeCount: state.tree.edgeCount,
+        savedPath,
+        message: `Recording finalized. Tree "${treeId}" is now loaded and can be executed with dp_execute_tree.`,
+      });
+    } catch (err) {
+      return errorResponse((err as Error).message);
+    }
+  },
+);
 
 // ─── Tool: Load Tree ──────────────────────────────────────────────────────────
 

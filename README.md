@@ -195,6 +195,17 @@ Or for Claude Desktop (`claude_desktop_config.json`):
 
 ### Available tools
 
+**Recording** — capture sessions as they happen:
+
+| Tool | Description |
+|------|-------------|
+| `dp_start_recording` | Begin recording a new task |
+| `dp_record_step` | Append a step (tool call, decision, condition check) |
+| `dp_record_branch` | Mark a decision point with alternatives considered |
+| `dp_finalize_recording` | End with success/failure, optionally save to file |
+
+**Playback** — load and execute captured trees:
+
 | Tool | Description |
 |------|-------------|
 | `dp_load_tree` | Load a tree from a JSON file or inline JSON |
@@ -204,7 +215,38 @@ Or for Claude Desktop (`claude_desktop_config.json`):
 | `dp_get_analytics` | Get execution analytics and bottleneck report |
 | `dp_export_tree` | Export a tree to JSON |
 
-The server runs locally on your machine. Trees, history, and recommendations stay local. Set `GEMINI_API_KEY` for LLM-powered decisions, or omit it to use the MockDecisionMaker (picks first available edge).
+### The workflow
+
+**First time doing a task** — the LLM records as it goes:
+
+```
+1. dp_start_recording({ taskName: "deploy-staging" })
+   → recordingId: "rec-..."
+
+2. [user asks Claude to deploy to staging]
+
+3. dp_record_step({ stepType: "tool_call", label: "Check git status", details: { toolName: "git_status" } })
+4. dp_record_step({ stepType: "tool_call", label: "Run tests", details: { toolName: "npm_test" } })
+5. dp_record_step({ stepType: "conversation", label: "Confirm env", edgeCondition: "tests passed" })
+6. dp_record_step({ stepType: "tool_call", label: "Deploy", details: { toolName: "deploy_staging" } })
+
+7. dp_finalize_recording({
+     outcome: "success",
+     outcomeMessage: "Deployed to staging",
+     savePath: "./trees/deploy-staging.json"
+   })
+```
+
+**Next time** — the LLM loads the tree and executes it:
+
+```
+1. dp_load_tree({ source: "./trees/deploy-staging.json" })
+2. dp_execute_tree({ treeId: "deploy-staging" })
+```
+
+After a few runs, the recommendation engine builds confidence and starts overriding LLM calls entirely — the same successful path gets replayed in 0ms.
+
+The server runs locally on your machine. Trees, history, and recommendations stay local. Set `GEMINI_API_KEY` for LLM-powered decisions, or omit it to use the MockDecisionMaker.
 
 Set `GEMINI_MODEL` to override the default model (e.g., `gemini-2.5-flash`).
 
