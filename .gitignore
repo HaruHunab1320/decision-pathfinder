@@ -5,6 +5,15 @@ benchmark-*
 .env
 .env.*
 
+# macOS
+.DS_Store
+**/.DS_Store
+
+# editor
+.vscode/
+.idea/
+*.swp
+
 # orchestrator-injected (do not commit agent config/memory files)
 CLAUDE.md
 .claude/

@@ -303,7 +303,7 @@ Everything runs locally. Trees, history, and recommendations stay on your machin
 
 ```bash
 npm run build      # compile to dist/
-npm run test       # 166 tests
+npm run test       # 153 tests
 npm run lint       # biome check
 npm run demo       # tree-driven README generator using Gemini
 npm run benchmark  # cross-model benchmark harness (flash-lite vs flash vs pro)
