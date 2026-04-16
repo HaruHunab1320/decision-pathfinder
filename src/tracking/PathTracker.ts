@@ -8,9 +8,9 @@ import type {
 } from '../core/interfaces.js';
 
 export class PathTracker implements IEnhancedPathTracker {
-  private path: EnhancedPathRecord[] = [];
-  private sessions: EnhancedPathRecord[][] = [];
-  private inSession = false;
+  protected path: EnhancedPathRecord[] = [];
+  protected sessions: EnhancedPathRecord[][] = [];
+  protected inSession = false;
 
   recordVisit(nodeId: NodeId, metadata?: NodeMetadata): void {
     const record: EnhancedPathRecord = {

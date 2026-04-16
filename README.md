@@ -15,6 +15,10 @@ Run 10: Locked in → 0ms, 100% confidence, zero API calls forever
 
 The recommendation engine rebuilds after every execution. Each run feeds back into higher confidence scores, which trigger more overrides, which produce more consistent data. It's a flywheel.
 
+**Efficiency-weighted confidence** means the system rewards shorter paths. A 3-step successful path ranks higher than a 10-step successful path, even at equal success rates. Over time agents naturally discover shortcuts — wasted tool calls get pruned, redundant decisions get skipped.
+
+**Persistent history** means session data survives across process restarts. The MCP server writes completed sessions to `~/.decision-pathfinder/sessions/{treeId}.jsonl` (append-only). Every invocation picks up where the last one left off — real cross-session learning.
+
 ## Install
 
 ```bash
@@ -210,6 +214,7 @@ Or for Claude Desktop (`claude_desktop_config.json`):
 |------|-------------|
 | `dp_load_tree` | Load a tree from a JSON file or inline JSON |
 | `dp_list_trees` | List all loaded trees |
+| `dp_get_history_summary` | Show accumulated wisdom for a tree (session count, success rate, shortest known path) — use BEFORE executing to know if prior experience is available |
 | `dp_execute_tree` | Execute a tree (uses Gemini + recommendations automatically) |
 | `dp_get_recommendation` | Get edge recommendation at a node |
 | `dp_get_analytics` | Get execution analytics and bottleneck report |

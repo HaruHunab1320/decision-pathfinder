@@ -11,6 +11,8 @@ export interface PathAnalysis {
   averagePathLength: number;
   mostCommonPath: NodeId[];
   mostSuccessfulPath: NodeId[];
+  /** Shortest successful path by node count. Empty if no successful sessions. */
+  shortestSuccessfulPath: NodeId[];
   bottleneckNodes: NodeId[];
 }
 
@@ -53,6 +55,7 @@ export class RecommendationEngine {
         averagePathLength: 0,
         mostCommonPath: [],
         mostSuccessfulPath: [],
+        shortestSuccessfulPath: [],
         bottleneckNodes: [],
       };
     }
@@ -128,6 +131,18 @@ export class RecommendationEngine {
       ? mostSuccessfulPathKey.split('->')
       : [];
 
+    // Shortest successful path (by final-record status)
+    let shortestSuccessfulPath: NodeId[] = [];
+    let shortestLen = Number.POSITIVE_INFINITY;
+    for (const session of sessions) {
+      const last = session[session.length - 1];
+      const succeeded = last?.status === 'success';
+      if (succeeded && session.length < shortestLen) {
+        shortestLen = session.length;
+        shortestSuccessfulPath = session.map((r) => r.nodeId);
+      }
+    }
+
     // Bottleneck nodes
     const bottlenecks = this.identifyBottlenecks();
     const bottleneckNodes = bottlenecks.map((b) => b.nodeId);
@@ -138,6 +153,7 @@ export class RecommendationEngine {
       averagePathLength,
       mostCommonPath,
       mostSuccessfulPath,
+      shortestSuccessfulPath,
       bottleneckNodes,
     };
   }
@@ -186,10 +202,16 @@ export class RecommendationEngine {
     const sessions = this.tracker.getAllSessions();
 
     // For each outgoing edge target, track how often sessions that went through
-    // that target were successful
+    // that target were successful, and the lengths of those successful sessions
     const edgeOutcomes = new Map<
       string,
-      { edgeId: string; targetNodeId: NodeId; successes: number; total: number }
+      {
+        edgeId: string;
+        targetNodeId: NodeId;
+        successes: number;
+        total: number;
+        successfulLengths: number[];
+      }
     >();
 
     for (const edge of outgoingEdges) {
@@ -198,7 +220,18 @@ export class RecommendationEngine {
         targetNodeId: edge.targetId,
         successes: 0,
         total: 0,
+        successfulLengths: [],
       });
+    }
+
+    // Also track the shortest successful session length overall (for efficiency weighting)
+    let shortestSuccessLength = Number.POSITIVE_INFINITY;
+    for (const session of sessions) {
+      const last = session[session.length - 1];
+      const sessionSucceeded = last?.status === 'success';
+      if (sessionSucceeded && session.length < shortestSuccessLength) {
+        shortestSuccessLength = session.length;
+      }
     }
 
     for (const session of sessions) {
@@ -220,6 +253,7 @@ export class RecommendationEngine {
                 );
                 if (allSuccessful) {
                   outcomes.successes++;
+                  outcomes.successfulLengths.push(session.length);
                 }
               }
               break;
@@ -229,15 +263,39 @@ export class RecommendationEngine {
       }
     }
 
-    // Find the best edge
+    // Compute composite confidence for each edge: success_rate × sample_factor × efficiency_factor
+    // Efficiency factor rewards edges whose successful sessions are short relative to the
+    // shortest successful session seen for this tree.
+    const computeConfidence = (outcomes: {
+      successes: number;
+      total: number;
+      successfulLengths: number[];
+    }): number => {
+      const rate = outcomes.total > 0 ? outcomes.successes / outcomes.total : 0;
+      const sampleFactor = Math.min(outcomes.total / 10, 1);
+
+      let efficiencyFactor = 1;
+      if (outcomes.successfulLengths.length > 0 && shortestSuccessLength !== Number.POSITIVE_INFINITY) {
+        const avgLen =
+          outcomes.successfulLengths.reduce((a, b) => a + b, 0) /
+          outcomes.successfulLengths.length;
+        efficiencyFactor = shortestSuccessLength / avgLen;
+      }
+
+      return rate * sampleFactor * efficiencyFactor;
+    };
+
+    // Find the best edge (highest composite confidence, with sample count as tiebreaker)
     let bestEdge:
       | {
           edgeId: string;
           targetNodeId: NodeId;
           successes: number;
           total: number;
+          successfulLengths: number[];
         }
       | undefined;
+    let bestConfidence = -1;
     let bestRate = -1;
 
     const allEdgeResults: Array<{
@@ -247,16 +305,18 @@ export class RecommendationEngine {
     }> = [];
 
     for (const outcomes of edgeOutcomes.values()) {
+      const conf = computeConfidence(outcomes);
       const rate = outcomes.total > 0 ? outcomes.successes / outcomes.total : 0;
       allEdgeResults.push({
         edgeId: outcomes.edgeId,
         targetNodeId: outcomes.targetNodeId,
-        confidence: rate,
+        confidence: conf,
       });
       if (
-        rate > bestRate ||
-        (rate === bestRate && outcomes.total > (bestEdge?.total ?? 0))
+        conf > bestConfidence ||
+        (conf === bestConfidence && outcomes.total > (bestEdge?.total ?? 0))
       ) {
+        bestConfidence = conf;
         bestRate = rate;
         bestEdge = outcomes;
       }
@@ -266,18 +326,21 @@ export class RecommendationEngine {
       return null;
     }
 
-    // Confidence is based on sample size and success rate
-    const sampleSizeFactor = Math.min(bestEdge.total / 10, 1); // caps at 10 samples
-    const confidence = bestRate * sampleSizeFactor;
+    const confidence = bestConfidence < 0 ? 0 : bestConfidence;
 
     const alternativeEdges = allEdgeResults
       .filter((e) => e.edgeId !== bestEdge?.edgeId)
       .sort((a, b) => b.confidence - a.confidence);
 
     const totalSamples = bestEdge.total;
+    const avgLen =
+      bestEdge.successfulLengths.length > 0
+        ? bestEdge.successfulLengths.reduce((a, b) => a + b, 0) /
+          bestEdge.successfulLengths.length
+        : 0;
     const reasoning =
       totalSamples > 0
-        ? `Edge "${bestEdge.edgeId}" led to successful outcomes in ${bestEdge.successes}/${totalSamples} sessions (${(bestRate * 100).toFixed(1)}% success rate).`
+        ? `Edge "${bestEdge.edgeId}" succeeded in ${bestEdge.successes}/${totalSamples} sessions (${(bestRate * 100).toFixed(1)}% rate, avg path length ${avgLen.toFixed(1)}, shortest known ${shortestSuccessLength === Number.POSITIVE_INFINITY ? 'n/a' : shortestSuccessLength}).`
         : `No historical data available for edges from node "${fromNodeId}". Recommendation is based on default ordering.`;
 
     return {

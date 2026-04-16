@@ -15,10 +15,15 @@
  *   Playback / execution:
  *     dp_load_tree         — Load a tree from JSON file or inline
  *     dp_list_trees        — List all loaded trees
+ *     dp_get_history_summary — Show accumulated wisdom for a tree
  *     dp_execute_tree      — Execute a tree (auto-uses recommendations)
  *     dp_get_recommendation — Get edge recommendation at a node
  *     dp_get_analytics     — Get execution analytics and bottleneck report
  *     dp_export_tree       — Export a tree to JSON
+ *
+ * Session persistence: Completed executions are appended to JSONL files at
+ * ~/.decision-pathfinder/sessions/{treeId}.jsonl, so recommendations
+ * accumulate across process restarts.
  */
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -38,6 +43,7 @@ import { ToolCallNode } from '../nodes/ToolCallNode.js';
 import { ConditionalNode } from '../nodes/ConditionalNode.js';
 import { SuccessNode } from '../nodes/SuccessNode.js';
 import { FailureNode } from '../nodes/FailureNode.js';
+import { SessionStore, PersistentPathTracker } from '../persistence/index.js';
 import type { IDecisionMaker } from '../execution/TreeExecutor.js';
 
 // ─── State ────────────────────────────────────────────────────────────────────
@@ -47,6 +53,7 @@ interface TreeState {
   tracker: PathTracker;
   name: string;
   loadedAt: string;
+  priorSessions: number;
 }
 
 interface RecordingState {
@@ -64,6 +71,18 @@ interface RecordingState {
 const trees = new Map<string, TreeState>();
 const recordings = new Map<string, RecordingState>();
 const serializer = new TreeSerializer();
+const sessionStore = new SessionStore(
+  process.env['DECISION_PATHFINDER_STORE'] || undefined,
+);
+
+async function createPersistentTracker(treeId: string): Promise<{
+  tracker: PersistentPathTracker;
+  priorSessions: number;
+}> {
+  const tracker = new PersistentPathTracker(sessionStore, treeId);
+  await tracker.initialize();
+  return { tracker, priorSessions: tracker.getPriorSessionCount() };
+}
 
 function getRecording(recordingId: string): RecordingState {
   const state = recordings.get(recordingId);
@@ -332,13 +351,16 @@ server.registerTool(
         });
       }
 
-      // Register as a loaded tree so it can be executed later
+      // Register as a loaded tree so it can be executed later.
+      // Swap in a PersistentPathTracker seeded with any prior history for this treeId.
       const treeId = slugify(state.taskName);
+      const { tracker, priorSessions } = await createPersistentTracker(treeId);
       trees.set(treeId, {
         tree: state.tree,
-        tracker: state.tracker,
+        tracker,
         name: state.taskName,
         loadedAt: new Date().toISOString(),
+        priorSessions,
       });
 
       let savedPath: string | undefined;
@@ -403,17 +425,20 @@ server.registerTool(
           ? `tree-${trees.size + 1}`
           : path.basename(args.source, '.json'));
 
+      const { tracker, priorSessions } = await createPersistentTracker(id);
       trees.set(id, {
         tree,
-        tracker: new PathTracker(),
+        tracker,
         name: id,
         loadedAt: new Date().toISOString(),
+        priorSessions,
       });
 
       return jsonResponse({
         treeId: id,
         nodeCount: tree.nodeCount,
         edgeCount: tree.edgeCount,
+        priorSessions,
         rootNodes: tree.getRootNodes().map((n) => ({
           id: n.id,
           type: n.type,
@@ -432,17 +457,74 @@ server.registerTool(
   'dp_list_trees',
   {
     title: 'List Decision Trees',
-    description: 'List all loaded decision trees with their IDs, node counts, and session history.',
+    description:
+      'List all loaded decision trees with their IDs, node counts, and how many sessions of history the system has accumulated.',
   },
   async () => {
     const list = [...trees.entries()].map(([id, state]) => ({
       treeId: id,
       nodeCount: state.tree.nodeCount,
       edgeCount: state.tree.edgeCount,
-      sessions: state.tracker.getAllSessions().length,
+      totalSessions: state.tracker.getAllSessions().length,
       loadedAt: state.loadedAt,
     }));
     return jsonResponse(list);
+  },
+);
+
+// ─── Tool: History Summary ────────────────────────────────────────────────────
+
+server.registerTool(
+  'dp_get_history_summary',
+  {
+    title: 'Get History Summary',
+    description:
+      'Show how much accumulated wisdom the system has for a given tree: session count, success rate, and shortest known successful path. Use this BEFORE executing a task to know whether prior experience is available. Also works for treeIds that have never been loaded — it checks the persistent store directly.',
+    inputSchema: {
+      treeId: z.string().describe('The tree ID to check history for'),
+    },
+  },
+  async (args) => {
+    try {
+      const persisted = await sessionStore.load(args.treeId);
+      const loaded = trees.get(args.treeId);
+
+      if (persisted.length === 0 && !loaded) {
+        return jsonResponse({
+          treeId: args.treeId,
+          hasHistory: false,
+          message: 'No prior sessions for this tree. This will be the first run.',
+        });
+      }
+
+      const successCount = persisted.filter((s) => s.finalStatus === 'success').length;
+      const failureCount = persisted.filter(
+        (s) => s.finalStatus === 'failure' || s.finalStatus === 'error' || s.finalStatus === 'max_steps_exceeded',
+      ).length;
+      const successLengths = persisted
+        .filter((s) => s.finalStatus === 'success')
+        .map((s) => s.stepCount);
+      const shortestSuccess = successLengths.length > 0 ? Math.min(...successLengths) : null;
+      const avgSuccess =
+        successLengths.length > 0
+          ? successLengths.reduce((a, b) => a + b, 0) / successLengths.length
+          : null;
+
+      return jsonResponse({
+        treeId: args.treeId,
+        hasHistory: persisted.length > 0,
+        loaded: loaded !== undefined,
+        totalSessions: persisted.length,
+        successCount,
+        failureCount,
+        successRate: persisted.length > 0 ? successCount / persisted.length : 0,
+        shortestSuccessfulSteps: shortestSuccess,
+        averageSuccessfulSteps: avgSuccess,
+        mostRecentSession: persisted.length > 0 ? persisted[persisted.length - 1]!.timestamp : null,
+      });
+    } catch (err) {
+      return errorResponse((err as Error).message);
+    }
   },
 );
 
