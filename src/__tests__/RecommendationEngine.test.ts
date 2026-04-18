@@ -176,3 +176,113 @@ describe('RecommendationEngine — efficiency-weighted confidence', () => {
     expect(engine.analyzeHistory().shortestSuccessfulPath).toEqual([]);
   });
 });
+
+describe('RecommendationEngine — family-pooled sessions', () => {
+  it('pooledSessions contribute to edge recommendations', () => {
+    // Tree: start → [A | B]
+    const tree = new DecisionTree();
+    const tracker = new PathTracker();
+
+    tree.addNode(node('start'));
+    tree.addNode(node('A'));
+    tree.addNode(node('B'));
+    tree.addNode(node('end'));
+    tree.addEdge(edge('e-start-A', 'start', 'A'));
+    tree.addEdge(edge('e-start-B', 'start', 'B'));
+    tree.addEdge(edge('e-A-end', 'A', 'end'));
+    tree.addEdge(edge('e-B-end', 'B', 'end'));
+
+    // No sessions on the tracker itself (brand new tree)
+    const engine = new RecommendationEngine(tree, tracker);
+
+    // But pooled sessions from a sibling strongly favor path A
+    const siblingRecords = Array.from({ length: 10 }, () => [
+      {
+        nodeId: 'start',
+        timestamp: Date.now(),
+        metadata: {},
+        status: 'success' as const,
+      },
+      {
+        nodeId: 'A',
+        timestamp: Date.now(),
+        metadata: {},
+        status: 'success' as const,
+      },
+      {
+        nodeId: 'end',
+        timestamp: Date.now(),
+        metadata: {},
+        status: 'success' as const,
+      },
+    ]);
+    engine.pooledSessions = siblingRecords;
+
+    const rec = engine.getEdgeRecommendation('start');
+    expect(rec).not.toBeNull();
+    expect(rec!.recommendedEdgeId).toBe('e-start-A');
+    expect(rec!.confidence).toBeGreaterThan(0);
+  });
+
+  it('own sessions and pooled sessions are both considered', () => {
+    const tree = new DecisionTree();
+    const tracker = new PathTracker();
+
+    tree.addNode(node('start'));
+    tree.addNode(node('A'));
+    tree.addNode(node('B'));
+    tree.addNode(node('end'));
+    tree.addEdge(edge('e-start-A', 'start', 'A'));
+    tree.addEdge(edge('e-start-B', 'start', 'B'));
+    tree.addEdge(edge('e-A-end', 'A', 'end'));
+    tree.addEdge(edge('e-B-end', 'B', 'end'));
+
+    // Own sessions favor B
+    for (let i = 0; i < 10; i++) {
+      recordSession(tracker, ['start', 'B', 'end'], 'success');
+    }
+
+    const engine = new RecommendationEngine(tree, tracker);
+    const analysis = engine.analyzeHistory();
+    expect(analysis.totalSessions).toBe(10);
+
+    // Pooled sessions also exist (favor A) — total should be combined
+    engine.pooledSessions = Array.from({ length: 5 }, () => [
+      {
+        nodeId: 'start',
+        timestamp: Date.now(),
+        metadata: {},
+        status: 'success' as const,
+      },
+      {
+        nodeId: 'A',
+        timestamp: Date.now(),
+        metadata: {},
+        status: 'success' as const,
+      },
+      {
+        nodeId: 'end',
+        timestamp: Date.now(),
+        metadata: {},
+        status: 'success' as const,
+      },
+    ]);
+
+    const combined = engine.analyzeHistory();
+    expect(combined.totalSessions).toBe(15); // 10 own + 5 pooled
+  });
+
+  it('pooledSessions defaults to empty — no effect when unset', () => {
+    const tree = new DecisionTree();
+    const tracker = new PathTracker();
+    tree.addNode(node('start'));
+    tree.addNode(node('end'));
+    tree.addEdge(edge('e1', 'start', 'end'));
+
+    recordSession(tracker, ['start', 'end'], 'success');
+
+    const engine = new RecommendationEngine(tree, tracker);
+    expect(engine.pooledSessions).toEqual([]);
+    expect(engine.analyzeHistory().totalSessions).toBe(1);
+  });
+});

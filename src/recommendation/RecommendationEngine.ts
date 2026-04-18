@@ -39,13 +39,26 @@ export interface EdgeRecommendation {
 }
 
 export class RecommendationEngine {
+  /**
+   * Extra sessions (e.g. from family-sibling trees) to merge with the
+   * tracker's own sessions when computing recommendations.
+   */
+  pooledSessions: EnhancedPathRecord[][] = [];
+
   constructor(
     private tree: IDecisionTree,
     private tracker: IEnhancedPathTracker,
   ) {}
 
+  /** All sessions: tracker-owned + pooled from family siblings. */
+  private getAllSessions(): EnhancedPathRecord[][] {
+    const own = this.tracker.getAllSessions();
+    if (this.pooledSessions.length === 0) return own;
+    return [...own, ...this.pooledSessions];
+  }
+
   analyzeHistory(): PathAnalysis {
-    const sessions = this.tracker.getAllSessions();
+    const sessions = this.getAllSessions();
     const totalSessions = sessions.length;
 
     if (totalSessions === 0) {
@@ -159,7 +172,7 @@ export class RecommendationEngine {
   }
 
   getNodeStats(nodeId: NodeId): NodeStats {
-    const sessions = this.tracker.getAllSessions();
+    const sessions = this.getAllSessions();
     let visitCount = 0;
     let successCount = 0;
     let failureCount = 0;
@@ -199,7 +212,7 @@ export class RecommendationEngine {
       return null;
     }
 
-    const sessions = this.tracker.getAllSessions();
+    const sessions = this.getAllSessions();
 
     // For each outgoing edge target, track how often sessions that went through
     // that target were successful, and the lengths of those successful sessions
@@ -357,7 +370,7 @@ export class RecommendationEngine {
   }
 
   identifyBottlenecks(failureThreshold: number = 0.5): NodeStats[] {
-    const sessions = this.tracker.getAllSessions();
+    const sessions = this.getAllSessions();
     const nodeIds = new Set<NodeId>();
 
     for (const session of sessions) {
@@ -395,7 +408,7 @@ export class RecommendationEngine {
     const edgeRecommendations = new Map<NodeId, EdgeRecommendation>();
 
     // Generate edge recommendations for all nodes that have outgoing edges
-    const sessions = this.tracker.getAllSessions();
+    const sessions = this.getAllSessions();
     const visitedNodes = new Set<NodeId>();
     for (const session of sessions) {
       for (const record of session) {

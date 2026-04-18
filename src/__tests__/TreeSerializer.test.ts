@@ -282,7 +282,7 @@ describe('TreeSerializer', () => {
 
       expect(typeof json).toBe('string');
       const parsed = JSON.parse(json);
-      expect(parsed.version).toBe(1);
+      expect(parsed.version).toBe(2);
       expect(parsed.nodes).toHaveLength(1);
     });
 

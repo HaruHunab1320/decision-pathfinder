@@ -20,6 +20,7 @@
  *     dp_execute_tree      — Execute a tree (auto-uses recommendations)
  *     dp_get_recommendation — Get edge recommendation at a node
  *     dp_get_analytics     — Get execution analytics and bottleneck report
+ *     dp_find_tree         — Search for trees by task description
  *     dp_export_tree       — Export a tree to JSON
  *
  * Session persistence: Completed executions are appended to JSONL files at
@@ -52,7 +53,11 @@ import { ConversationNode } from '../nodes/ConversationNode.js';
 import { FailureNode } from '../nodes/FailureNode.js';
 import { SuccessNode } from '../nodes/SuccessNode.js';
 import { ToolCallNode } from '../nodes/ToolCallNode.js';
-import { PersistentPathTracker, SessionStore } from '../persistence/index.js';
+import {
+  PersistentPathTracker,
+  SessionStore,
+  TreeIndex,
+} from '../persistence/index.js';
 import { RecommendationEngine } from '../recommendation/RecommendationEngine.js';
 import { TreeSerializer } from '../serialization/TreeSerializer.js';
 import { PathTracker } from '../tracking/PathTracker.js';
@@ -71,6 +76,8 @@ interface RecordingState {
   recordingId: string;
   taskName: string;
   description: string;
+  family?: string;
+  tags: string[];
   tree: DecisionTree;
   tracker: PathTracker;
   lastNodeId: string | null;
@@ -85,6 +92,7 @@ const serializer = new TreeSerializer();
 const sessionStore = new SessionStore(
   process.env.DECISION_PATHFINDER_STORE || undefined,
 );
+const treeIndex = new TreeIndex(sessionStore.getStoreDir());
 
 async function createPersistentTracker(treeId: string): Promise<{
   tracker: PersistentPathTracker;
@@ -93,6 +101,27 @@ async function createPersistentTracker(treeId: string): Promise<{
   const tracker = new PersistentPathTracker(sessionStore, treeId);
   await tracker.initialize();
   return { tracker, priorSessions: tracker.getPriorSessionCount() };
+}
+
+import type { EnhancedPathRecord } from '../core/interfaces.js';
+
+/**
+ * Load sessions from family-sibling trees and return them as flat
+ * EnhancedPathRecord[][] suitable for RecommendationEngine.pooledSessions.
+ */
+async function loadFamilySessions(
+  treeId: string,
+): Promise<EnhancedPathRecord[][]> {
+  const siblingIds = treeIndex.getFamilySiblings(treeId);
+  if (siblingIds.length === 0) return [];
+  const pooled: EnhancedPathRecord[][] = [];
+  for (const sibId of siblingIds) {
+    const sessions = await sessionStore.load(sibId);
+    for (const s of sessions) {
+      if (s.records.length > 0) pooled.push(s.records);
+    }
+  }
+  return pooled;
 }
 
 interface SelectedProvider {
@@ -209,6 +238,18 @@ server.registerTool(
         .string()
         .optional()
         .describe('Longer description of what this task accomplishes'),
+      family: z
+        .string()
+        .optional()
+        .describe(
+          'Family group for this tree (e.g., "deployment"). Trees in the same family share session history for better recommendations.',
+        ),
+      tags: z
+        .array(z.string())
+        .optional()
+        .describe(
+          'Tags for discovery (e.g., ["deploy", "docker", "k8s"]). Used by dp_find_tree.',
+        ),
     },
   },
   async (args) => {
@@ -223,17 +264,20 @@ server.registerTool(
       }),
     );
 
-    recordings.set(recordingId, {
+    const recording: RecordingState = {
       recordingId,
       taskName: args.taskName,
       description: args.description ?? '',
+      tags: args.tags ?? [],
       tree,
       tracker: new PathTracker(),
       lastNodeId: startNodeId,
       nodeCounter: 1,
       edgeCounter: 0,
       startedAt: new Date().toISOString(),
-    });
+    };
+    if (args.family !== undefined) recording.family = args.family;
+    recordings.set(recordingId, recording);
 
     return jsonResponse({
       recordingId,
@@ -441,6 +485,16 @@ server.registerTool(
         });
       }
 
+      // Attach metadata to the tree
+      state.tree.metadata = {
+        taskName: state.taskName,
+        createdAt: state.startedAt,
+      };
+      if (state.family !== undefined)
+        state.tree.metadata.family = state.family;
+      if (state.tags.length > 0) state.tree.metadata.tags = state.tags;
+      if (state.description) state.tree.metadata.description = state.description;
+
       // Register as a loaded tree so it can be executed later.
       // Swap in a PersistentPathTracker seeded with any prior history for this treeId.
       const treeId = slugify(state.taskName);
@@ -452,6 +506,19 @@ server.registerTool(
         loadedAt: new Date().toISOString(),
         priorSessions,
       });
+
+      // Update the tree index for discovery
+      const indexEntry: Parameters<typeof treeIndex.upsert>[0] = {
+        treeId,
+        tags: state.tags,
+        taskName: state.taskName,
+        sessionCount: priorSessions,
+        lastUsed: new Date().toISOString(),
+        createdAt: state.startedAt,
+      };
+      if (state.family !== undefined) indexEntry.family = state.family;
+      if (state.description) indexEntry.description = state.description;
+      await treeIndex.upsert(indexEntry);
 
       let savedPath: string | undefined;
       if (args.savePath) {
@@ -465,6 +532,8 @@ server.registerTool(
       return jsonResponse({
         recordingId: args.recordingId,
         treeId,
+        family: state.family,
+        tags: state.tags,
         outcome: args.outcome,
         nodeCount: state.tree.nodeCount,
         edgeCount: state.tree.edgeCount,
@@ -527,8 +596,28 @@ server.registerTool(
         priorSessions,
       });
 
+      // Update the tree index for discovery
+      const meta = tree.metadata;
+      const loadIndexEntry: Parameters<typeof treeIndex.upsert>[0] = {
+        treeId: id,
+        tags: meta.tags ?? [],
+        taskName: meta.taskName ?? id,
+        sessionCount: priorSessions,
+        lastUsed: new Date().toISOString(),
+      };
+      if (meta.family !== undefined) loadIndexEntry.family = meta.family;
+      if (meta.description !== undefined)
+        loadIndexEntry.description = meta.description;
+      if (meta.createdAt !== undefined)
+        loadIndexEntry.createdAt = meta.createdAt;
+      if (!args.source.trim().startsWith('{'))
+        loadIndexEntry.treePath = path.resolve(args.source);
+      await treeIndex.upsert(loadIndexEntry);
+
       return jsonResponse({
         treeId: id,
+        family: meta.family,
+        tags: meta.tags,
         nodeCount: tree.nodeCount,
         edgeCount: tree.edgeCount,
         priorSessions,
@@ -556,6 +645,8 @@ server.registerTool(
   async () => {
     const list = [...trees.entries()].map(([id, state]) => ({
       treeId: id,
+      family: state.tree.metadata.family,
+      tags: state.tree.metadata.tags,
       nodeCount: state.tree.nodeCount,
       edgeCount: state.tree.edgeCount,
       totalSessions: state.tracker.getAllSessions().length,
@@ -669,12 +760,18 @@ server.registerTool(
       const provider = selectProvider();
       let decisionMaker: IDecisionMaker = provider.adapter;
 
+      // Pool family-sibling sessions for cross-tree recommendations
+      const familySessions = await loadFamilySessions(args.treeId);
+      const hasSessions =
+        tracker.getAllSessions().length > 0 || familySessions.length > 0;
+
       if (
         provider.name !== 'mock' &&
         args.useRecommendations !== false &&
-        tracker.getAllSessions().length > 0
+        hasSessions
       ) {
         const engine = new RecommendationEngine(tree, tracker);
+        engine.pooledSessions = familySessions;
         const inner = provider.adapter;
         decisionMaker = {
           async decide(context) {
@@ -722,6 +819,7 @@ server.registerTool(
         variables: result.variables,
         error: result.error,
         totalSessions: tracker.getAllSessions().length,
+        familySessionsPooled: familySessions.length,
         provider: provider.name,
         model: provider.modelName,
       });
@@ -748,6 +846,7 @@ server.registerTool(
     try {
       const state = getTree(args.treeId);
       const engine = new RecommendationEngine(state.tree, state.tracker);
+      engine.pooledSessions = await loadFamilySessions(args.treeId);
       const rec = engine.getEdgeRecommendation(args.nodeId);
 
       if (!rec) {
@@ -758,6 +857,7 @@ server.registerTool(
         });
       }
 
+      const siblingCount = treeIndex.getFamilySiblings(args.treeId).length;
       return jsonResponse({
         nodeId: args.nodeId,
         recommendedEdgeId: rec.recommendedEdgeId,
@@ -765,6 +865,8 @@ server.registerTool(
         confidence: rec.confidence,
         reasoning: rec.reasoning,
         alternatives: rec.alternativeEdges,
+        familyPooled: siblingCount > 0,
+        familySiblings: siblingCount,
       });
     } catch (err) {
       return errorResponse((err as Error).message);
@@ -788,6 +890,7 @@ server.registerTool(
     try {
       const state = getTree(args.treeId);
       const engine = new RecommendationEngine(state.tree, state.tracker);
+      engine.pooledSessions = await loadFamilySessions(args.treeId);
       const report = engine.generateOptimizationReport();
       const bottlenecks = engine.identifyBottlenecks(0.3);
 
@@ -812,6 +915,67 @@ server.registerTool(
           failureRate: b.visitCount > 0 ? b.failureCount / b.visitCount : 0,
         })),
         edgeRecommendations: edgeRecs,
+      });
+    } catch (err) {
+      return errorResponse((err as Error).message);
+    }
+  },
+);
+
+// ─── Tool: Find Tree ─────────────────────────────────────────────────────────
+
+server.registerTool(
+  'dp_find_tree',
+  {
+    title: 'Find Decision Tree',
+    description:
+      'Search for the best decision tree to use for a given task. Ranks trees by tag, name, and description relevance. Returns top matches with scores and match reasons. Use this BEFORE dp_load_tree when you know what task you want to accomplish but not which tree to use.',
+    inputSchema: {
+      taskDescription: z
+        .string()
+        .describe(
+          'Describe the task you want to accomplish (e.g., "deploy the background worker service")',
+        ),
+      family: z
+        .string()
+        .optional()
+        .describe('Optionally filter to a specific family'),
+      limit: z
+        .number()
+        .optional()
+        .describe('Max results to return. Default: 5'),
+    },
+  },
+  async (args) => {
+    try {
+      let results = treeIndex.search(args.taskDescription, args.limit ?? 5);
+
+      if (args.family !== undefined) {
+        results = results.filter((r) => r.family === args.family);
+      }
+
+      if (results.length === 0) {
+        return jsonResponse({
+          matches: [],
+          message:
+            'No matching trees found. Use dp_start_recording to create a new tree for this task.',
+        });
+      }
+
+      return jsonResponse({
+        matches: results.map((r) => ({
+          treeId: r.treeId,
+          family: r.family,
+          tags: r.tags,
+          taskName: r.taskName,
+          description: r.description,
+          sessionCount: r.sessionCount,
+          lastUsed: r.lastUsed,
+          treePath: r.treePath,
+          score: r.score,
+          matchReasons: r.matchReasons,
+        })),
+        message: `Found ${results.length} matching tree(s). Use dp_load_tree with the treeId or treePath to load one.`,
       });
     } catch (err) {
       return errorResponse((err as Error).message);

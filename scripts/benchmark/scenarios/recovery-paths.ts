@@ -1,9 +1,10 @@
 /**
  * Scenario 6: Recovery Paths
  *
- * Primary path is blocked (100% failure on first tool). Recovery branch
- * has a tool with 30% failure, requiring a second fallback. Success requires
- * navigating 2 levels of recovery.
+ * Primary path is blocked (100% failure) and cascades to backup. Backup
+ * has 30% failure rate and cascades to manual fallback. Manual always
+ * succeeds but is longer. Recommendations should learn to skip primary
+ * and eventually prefer the shortest reliable path.
  */
 import { DecisionTree } from '../../../src/core/DecisionTree.js';
 import { ConversationNode } from '../../../src/nodes/ConversationNode.js';
@@ -66,11 +67,11 @@ export function buildRecoveryPaths(): ScenarioDefinition {
 
   tree.addEdge({ id: 'e-p-to-check', sourceId: 'primary', targetId: 'p-check', metadata: {} });
   tree.addEdge({ id: 'e-p-ok', sourceId: 'p-check', targetId: 'done', metadata: {} });
-  tree.addEdge({ id: 'e-p-fail', sourceId: 'p-check', targetId: 'all-failed', metadata: {} });
+  tree.addEdge({ id: 'e-p-fail', sourceId: 'p-check', targetId: 'backup', condition: 'Primary failed — fall back to backup', metadata: {} });
 
   tree.addEdge({ id: 'e-b-to-check', sourceId: 'backup', targetId: 'b-check', metadata: {} });
   tree.addEdge({ id: 'e-b-ok', sourceId: 'b-check', targetId: 'done', metadata: {} });
-  tree.addEdge({ id: 'e-b-fail', sourceId: 'b-check', targetId: 'all-failed', metadata: {} });
+  tree.addEdge({ id: 'e-b-fail', sourceId: 'b-check', targetId: 'manual-1', condition: 'Backup failed — fall back to manual', metadata: {} });
 
   tree.addEdge({ id: 'e-m1-m2', sourceId: 'manual-1', targetId: 'manual-2', metadata: {} });
   tree.addEdge({ id: 'e-m2-done', sourceId: 'manual-2', targetId: 'done', metadata: {} });
@@ -103,7 +104,7 @@ export function buildRecoveryPaths(): ScenarioDefinition {
 
   return {
     name: 'Recovery Paths',
-    description: 'Primary endpoint always fails (outage). Backup has 30% failure. Manual fallback always works but is longer. Recommendations should learn to skip primary.',
+    description: 'Primary endpoint always fails (outage) then cascades to backup. Backup has 30% failure and cascades to manual fallback. Manual always works but is longer. Recommendations should learn to skip primary and go straight to backup or manual.',
     tree,
     toolHandlers,
     conditionEvaluators: evals as Map<string, (ctx: { variables: Record<string, unknown> }) => boolean>,

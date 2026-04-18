@@ -12,5 +12,6 @@ export type {
   PathRecord,
   TraversalOrder,
   TraversalVisitor,
+  TreeMetadata,
   VisitStatus,
 } from './interfaces.js';

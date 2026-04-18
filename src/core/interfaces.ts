@@ -111,3 +111,12 @@ export interface IEnhancedPathTracker extends IPathTracker {
   endSession(): void; // end current session
   getAllSessions(): EnhancedPathRecord[][];
 }
+
+/** Metadata attached to a tree for family grouping and discovery. */
+export interface TreeMetadata {
+  family?: string;
+  tags?: string[];
+  description?: string;
+  taskName?: string;
+  createdAt?: string;
+}

@@ -6,9 +6,11 @@ import type {
   NodeId,
   TraversalOrder,
   TraversalVisitor,
+  TreeMetadata,
 } from './interfaces.js';
 
 export class DecisionTree implements IDecisionTree {
+  metadata: TreeMetadata = {};
   private nodes: Map<NodeId, INode> = new Map();
   private edges: Map<EdgeId, IEdge> = new Map();
   private outgoing: Map<NodeId, Set<EdgeId>> = new Map();

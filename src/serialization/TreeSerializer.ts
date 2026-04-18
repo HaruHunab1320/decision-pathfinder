@@ -1,5 +1,5 @@
 import { DecisionTree } from '../core/DecisionTree.js';
-import type { IEdge, INode, NodeMetadata } from '../core/interfaces.js';
+import type { IEdge, INode, NodeMetadata, TreeMetadata } from '../core/interfaces.js';
 import type { ConditionalNodeData } from '../nodes/ConditionalNode.js';
 import { ConditionalNode } from '../nodes/ConditionalNode.js';
 import type { ConversationNodeData } from '../nodes/ConversationNode.js';
@@ -22,7 +22,8 @@ export interface SerializedNode {
 }
 
 export interface SerializedTree {
-  version: 1;
+  version: 1 | 2;
+  metadata?: TreeMetadata;
   nodes: SerializedNode[];
   edges: IEdge[];
 }
@@ -106,7 +107,8 @@ export class TreeSerializer {
     });
 
     return {
-      version: 1,
+      version: 2,
+      metadata: tree.metadata,
       nodes,
       edges: tree.getAllEdges(),
     };
@@ -114,6 +116,11 @@ export class TreeSerializer {
 
   deserialize(data: SerializedTree): DecisionTree {
     const tree = new DecisionTree();
+
+    // Restore metadata (v2+); v1 files have no metadata field
+    if (data.metadata) {
+      tree.metadata = data.metadata;
+    }
 
     for (const serializedNode of data.nodes) {
       const factory = this.factories.get(serializedNode.type);
