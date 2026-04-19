@@ -8,6 +8,8 @@ import type { FailureNodeData } from '../nodes/FailureNode.js';
 import { FailureNode } from '../nodes/FailureNode.js';
 import type { SuccessNodeData } from '../nodes/SuccessNode.js';
 import { SuccessNode } from '../nodes/SuccessNode.js';
+import type { SubTreeNodeData } from '../nodes/SubTreeNode.js';
+import { SubTreeNode } from '../nodes/SubTreeNode.js';
 import type { ToolCallNodeData } from '../nodes/ToolCallNode.js';
 import { ToolCallNode } from '../nodes/ToolCallNode.js';
 
@@ -77,6 +79,12 @@ export class TreeSerializer {
       'failure',
       (s) =>
         new FailureNode(s.id, s.label, s.data as FailureNodeData, s.metadata),
+    );
+
+    this.factories.set(
+      'sub_tree',
+      (s) =>
+        new SubTreeNode(s.id, s.label, s.data as SubTreeNodeData, s.metadata),
     );
   }
 

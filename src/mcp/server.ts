@@ -65,6 +65,7 @@ import { ConversationNode } from '../nodes/ConversationNode.js';
 import { FailureNode } from '../nodes/FailureNode.js';
 import { SuccessNode } from '../nodes/SuccessNode.js';
 import { ToolCallNode } from '../nodes/ToolCallNode.js';
+import type { ISessionStore } from '../persistence/index.js';
 import {
   PersistentPathTracker,
   SessionStore,
@@ -118,9 +119,13 @@ const trees = new Map<string, TreeState>();
 const recordings = new Map<string, RecordingState>();
 const stepExecutions = new Map<string, StepExecutionState>();
 const serializer = new TreeSerializer();
-const sessionStore = new SessionStore(
-  process.env.DECISION_PATHFINDER_STORE || undefined,
-);
+import { SqliteSessionStore } from '../persistence/SqliteSessionStore.js';
+
+const storeDir = process.env.DECISION_PATHFINDER_STORE || undefined;
+const sessionStore: ISessionStore =
+  process.env.DP_STORE_BACKEND === 'sqlite'
+    ? new SqliteSessionStore(storeDir)
+    : new SessionStore(storeDir);
 const treeIndex = new TreeIndex(sessionStore.getStoreDir());
 // Sampling adapter — initialized after connection if client supports it
 let samplingAdapter: SamplingAdapter | null = null;
@@ -256,7 +261,7 @@ function errorResponse(msg: string) {
 
 const server = new McpServer({
   name: 'decision-pathfinder',
-  version: '1.2.0',
+  version: '1.3.0',
 });
 
 // ─── Tool: Start Recording ────────────────────────────────────────────────────

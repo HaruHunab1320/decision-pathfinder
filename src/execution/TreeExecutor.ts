@@ -36,11 +36,18 @@ export interface ExecutionContext {
   stepCount: number;
 }
 
+/** Resolves a tree by ID for sub-tree execution. */
+export type TreeResolver = (
+  treeId: string,
+) => Promise<{ tree: IDecisionTree; tracker: IEnhancedPathTracker } | null>;
+
 // Configuration for the executor
 export interface TreeExecutorConfig {
   maxSteps?: number;
   toolHandlers?: Map<string, ToolHandler>;
   conditionEvaluators?: Map<string, ConditionEvaluator>;
+  /** Resolver for SubTreeNode — looks up trees by ID for composition. */
+  treeResolver?: TreeResolver;
 }
 
 // Events emitted during execution
@@ -83,6 +90,7 @@ export class TreeExecutor {
   private maxSteps: number;
   private toolHandlers: Map<string, ToolHandler>;
   private conditionEvaluators: Map<string, ConditionEvaluator>;
+  private treeResolver: TreeResolver | undefined;
   private events: ExecutionEvents;
   private totalInputTokens = 0;
   private totalOutputTokens = 0;
@@ -101,6 +109,7 @@ export class TreeExecutor {
     this.maxSteps = config?.maxSteps ?? 100;
     this.toolHandlers = config?.toolHandlers ?? new Map();
     this.conditionEvaluators = config?.conditionEvaluators ?? new Map();
+    this.treeResolver = config?.treeResolver;
     this.events = events ?? {};
   }
 
@@ -224,6 +233,10 @@ export class TreeExecutor {
       return this.processToolCallNode(node, context, outgoingEdges);
     }
 
+    if (node.type === 'sub_tree') {
+      return this.processSubTreeNode(node, context, outgoingEdges);
+    }
+
     // Conversation nodes and any other type — ask the LLM
     return this.processDecisionNode(node, context, outgoingEdges);
   }
@@ -314,6 +327,90 @@ export class TreeExecutor {
       });
       throw error;
     }
+  }
+
+  private async processSubTreeNode(
+    node: INode,
+    context: ExecutionContext,
+    outgoingEdges: IEdge[],
+  ): Promise<NodeId> {
+    const data = (
+      node as INode & { data: { treeId: string; startNodeId?: string; inputVariables?: Record<string, unknown>; maxSteps?: number } }
+    ).data;
+
+    if (!this.treeResolver) {
+      this.tracker.recordEnhancedVisit(node.id, 'failure', {
+        error: 'No tree resolver configured — cannot execute sub-trees',
+      });
+      throw new Error(
+        `SubTreeNode "${node.id}" requires a treeResolver in TreeExecutorConfig`,
+      );
+    }
+
+    const resolved = await this.treeResolver(data.treeId);
+    if (!resolved) {
+      this.tracker.recordEnhancedVisit(node.id, 'failure', {
+        error: `Sub-tree "${data.treeId}" not found`,
+      });
+      throw new Error(`Sub-tree "${data.treeId}" not found`);
+    }
+
+    // Merge input variables into the sub-tree's context
+    const subExecutor = new TreeExecutor(
+      resolved.tree,
+      this.decisionMaker,
+      resolved.tracker,
+      {
+        maxSteps: data.maxSteps ?? 50,
+        toolHandlers: this.toolHandlers,
+        conditionEvaluators: this.conditionEvaluators,
+        treeResolver: this.treeResolver,
+      },
+    );
+
+    const startNodeId =
+      data.startNodeId ?? resolved.tree.getRootNodes()[0]?.id;
+    if (!startNodeId) {
+      throw new Error(`Sub-tree "${data.treeId}" has no root nodes`);
+    }
+
+    const result = await subExecutor.execute(startNodeId);
+
+    // Merge sub-tree results into parent context
+    context.variables[`subtree_${data.treeId}`] = {
+      status: result.status,
+      pathTaken: result.pathTaken,
+      variables: result.variables,
+      stepCount: result.stepCount,
+    };
+
+    // Accumulate token usage from sub-tree
+    if (result.totalTokenUsage) {
+      this.totalInputTokens += result.totalTokenUsage.inputTokens ?? 0;
+      this.totalOutputTokens += result.totalTokenUsage.outputTokens ?? 0;
+    }
+    if (result.llmCallCount) {
+      this.llmCallCount += result.llmCallCount;
+    }
+
+    if (result.status === 'success') {
+      this.tracker.recordEnhancedVisit(node.id, 'success');
+
+      if (outgoingEdges.length === 1) {
+        const edge = outgoingEdges[0]!;
+        this.events.onStepComplete?.(context, node, edge.id);
+        return edge.targetId;
+      }
+      return this.processDecisionNode(node, context, outgoingEdges);
+    }
+
+    // Sub-tree failed
+    this.tracker.recordEnhancedVisit(node.id, 'failure', {
+      error: result.error ?? `Sub-tree "${data.treeId}" ended with ${result.status}`,
+    });
+    throw new Error(
+      `Sub-tree "${data.treeId}" failed: ${result.error ?? result.status}`,
+    );
   }
 
   private async processDecisionNode(

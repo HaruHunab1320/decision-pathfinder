@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-04-18
+
+### Added
+
+- **SQLite session backend**: `SqliteSessionStore` as a drop-in replacement for
+  the JSONL store. Uses `better-sqlite3` with WAL mode — handles concurrency
+  natively, no file locking needed. Enable with `DP_STORE_BACKEND=sqlite`.
+  Common `ISessionStore` interface lets both backends be used interchangeably.
+- **Streaming execution events**: `ExecutionStream` wraps the executor and
+  yields events (`step_start`, `step_complete`, `tool_call`, `condition`,
+  `complete`, `error`) as an `AsyncIterableIterator`. Useful for UIs watching
+  traversal live.
+- **Tree composition**: `SubTreeNode` delegates execution to another tree by ID.
+  Sub-tree results and variables merge back into the parent context. Supports
+  nested composition (sub-trees can contain sub-trees) via a `TreeResolver`
+  callback. Registered in the serializer for JSON round-tripping.
+- `ExecutionStream` exported from `execution` module.
+- `SubTreeNode` and `SubTreeNodeData` exported from `nodes` module.
+- `TreeResolver` type exported from `execution` module.
+- `ISessionStore` interface exported from `persistence` module.
+- `SqliteSessionStore` exported from `persistence` module.
+- SQLite session store tests (13 tests covering CRUD, compaction, rotation).
+
+### Fixed
+
+- **Speed vs Accuracy benchmark**: Fast-path failure now cascades to the careful
+  path instead of dead-ending. Neutral prompt removes bias toward "fast."
+  Phase A went from 25% → 87.5% success; Phase B from 12.5% → 87.5%.
+- **Recovery Paths benchmark**: Neutral prompt (removed "default" bias toward
+  primary). Engine converges on backup/manual faster.
+- Overall benchmark: **91.1% Phase A → 96.4% Phase B** (+5.4%, 60% error
+  reduction). Was 85.7% → 76.8% before these fixes.
+
+### Changed
+
+- `PersistentPathTracker` now accepts `ISessionStore` instead of concrete
+  `SessionStore`, enabling SQLite or custom backends.
+- `better-sqlite3` added as a dependency.
+
 ## [1.2.0] - 2026-04-18
 
 ### Added
@@ -98,6 +137,7 @@ Initial public release.
 - Persistent JSONL session store with recommendation caching
 - Benchmark harness with 7 scenario types
 
+[1.3.0]: https://github.com/HaruHunab1320/decision-pathfinder/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/HaruHunab1320/decision-pathfinder/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/HaruHunab1320/decision-pathfinder/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/HaruHunab1320/decision-pathfinder/releases/tag/v1.0.0

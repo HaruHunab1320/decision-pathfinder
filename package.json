@@ -1,6 +1,6 @@
 {
   "name": "decision-pathfinder",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "A self-improving decision tree engine for LLM agents — build, execute, and learn from decision paths. Supports Claude, OpenAI, and Gemini with automatic recommendation caching so agents get faster and cheaper over time. Includes an MCP server for Claude Code, Cursor, and other MCP clients.",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -64,11 +64,13 @@
     "@anthropic-ai/sdk": "^0.86.1",
     "@google/generative-ai": "^0.24.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "better-sqlite3": "^12.8.0",
     "openai": "^6.34.0",
     "zod": "^4.3.6"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.10",
+    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^25.5.2",
     "tsx": "^4.21.0",
     "typescript": "^6.0.2",

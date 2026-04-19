@@ -20,7 +20,7 @@ export function buildRecoveryPaths(): ScenarioDefinition {
 
   // Choose path
   tree.addNode(new ConversationNode('start', 'Choose Service Endpoint', {
-    prompt: 'Select a service endpoint to process the request. The primary endpoint is the default choice. The backup endpoint is available if primary is down. The manual fallback requires more steps but always works.',
+    prompt: 'Select a service endpoint to process the request. Primary is fastest when working but may be down. Backup is reliable but sometimes fails. Manual fallback always works but requires more steps.',
   }));
 
   // ── Primary path (always fails — simulating outage) ──
@@ -61,9 +61,9 @@ export function buildRecoveryPaths(): ScenarioDefinition {
   }));
 
   // ── Edges ──
-  tree.addEdge({ id: 'e-start-primary', sourceId: 'start', targetId: 'primary', condition: 'Use primary endpoint (default)', metadata: {} });
-  tree.addEdge({ id: 'e-start-backup', sourceId: 'start', targetId: 'backup', condition: 'Use backup endpoint (if primary is down)', metadata: {} });
-  tree.addEdge({ id: 'e-start-manual', sourceId: 'start', targetId: 'manual-1', condition: 'Use manual fallback (always works, slower)', metadata: {} });
+  tree.addEdge({ id: 'e-start-primary', sourceId: 'start', targetId: 'primary', condition: 'Use primary endpoint (fastest when working)', metadata: {} });
+  tree.addEdge({ id: 'e-start-backup', sourceId: 'start', targetId: 'backup', condition: 'Use backup endpoint (reliable)', metadata: {} });
+  tree.addEdge({ id: 'e-start-manual', sourceId: 'start', targetId: 'manual-1', condition: 'Use manual fallback (always works)', metadata: {} });
 
   tree.addEdge({ id: 'e-p-to-check', sourceId: 'primary', targetId: 'p-check', metadata: {} });
   tree.addEdge({ id: 'e-p-ok', sourceId: 'p-check', targetId: 'done', metadata: {} });

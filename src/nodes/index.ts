@@ -6,5 +6,7 @@ export type { FailureNodeData } from './FailureNode.js';
 export { FailureNode } from './FailureNode.js';
 export type { SuccessNodeData } from './SuccessNode.js';
 export { SuccessNode } from './SuccessNode.js';
+export type { SubTreeNodeData } from './SubTreeNode.js';
+export { SubTreeNode } from './SubTreeNode.js';
 export type { ToolCallNodeData } from './ToolCallNode.js';
 export { ToolCallNode } from './ToolCallNode.js';

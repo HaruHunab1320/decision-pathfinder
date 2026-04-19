@@ -20,6 +20,25 @@ export interface PersistedSession {
   failureReason?: string;
 }
 
+/** Common interface for session stores (JSONL and SQLite). */
+export interface ISessionStore {
+  getStoreDir(): string;
+  append(treeId: string, session: PersistedSession): Promise<void>;
+  load(treeId: string): Promise<PersistedSession[]>;
+  clear(treeId: string): Promise<void>;
+  count(treeId: string): Promise<number>;
+  listTreeIds(): Promise<string[]>;
+  compact(
+    treeId: string,
+    retainRecent?: number,
+  ): Promise<{ dropped: number; summary: CompactionSummary | null }>;
+  rotate(treeId: string): Promise<string | null>;
+  loadWithAutoCompact(
+    treeId: string,
+  ): Promise<{ sessions: PersistedSession[]; compacted: boolean }>;
+  getCompactionSummary(treeId: string): Promise<CompactionSummary | null>;
+}
+
 /**
  * Append-only JSONL session store.
  *

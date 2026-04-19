@@ -2,8 +2,8 @@ import type { EnhancedPathRecord } from '../core/interfaces.js';
 import { PathTracker } from '../tracking/PathTracker.js';
 import type {
   FinalStatus,
+  ISessionStore,
   PersistedSession,
-  SessionStore,
 } from './SessionStore.js';
 
 /**
@@ -17,11 +17,11 @@ import type {
  *   // any endSession() call will also append to the .jsonl file on disk
  */
 export class PersistentPathTracker extends PathTracker {
-  private store: SessionStore;
+  private store: ISessionStore;
   private treeId: string;
   private initialized = false;
 
-  constructor(store: SessionStore, treeId: string) {
+  constructor(store: ISessionStore, treeId: string) {
     super();
     this.store = store;
     this.treeId = treeId;

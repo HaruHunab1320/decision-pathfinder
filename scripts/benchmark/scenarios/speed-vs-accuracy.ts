@@ -3,8 +3,9 @@
  *
  * Two paths from root: a "fast path" (2 nodes, 1 tool) with 70% failure rate,
  * and a "careful path" (4 nodes, 2 tools) with ~5% failure rate.
- * The prompt says "Choose the most efficient path."
- * Flash Lite will likely pick fast and fail. Recommendations should steer toward careful.
+ * Fast failure cascades into the careful path — so runs always have a way to
+ * succeed, but the fast→fail→careful route is longer. Recommendations should
+ * learn that "careful" directly is shorter and more reliable.
  */
 import { DecisionTree } from '../../../src/core/DecisionTree.js';
 import { ConversationNode } from '../../../src/nodes/ConversationNode.js';
@@ -20,7 +21,7 @@ export function buildSpeedVsAccuracy(): ScenarioDefinition {
 
   // Root decision
   tree.addNode(new ConversationNode('root', 'Choose Processing Path', {
-    prompt: 'You need to process a data request. Choose the most efficient path to complete it successfully.',
+    prompt: 'You need to process a data request. Choose a path to complete it successfully. The fast path is quicker but less reliable. The careful path takes longer but rarely fails.',
     expectedResponses: ['fast', 'careful'],
   }));
 
@@ -70,7 +71,7 @@ export function buildSpeedVsAccuracy(): ScenarioDefinition {
 
   tree.addEdge({ id: 'e-fast-to-check', sourceId: 'fast-process', targetId: 'fast-check', metadata: {} });
   tree.addEdge({ id: 'e-fast-success', sourceId: 'fast-check', targetId: 'fast-success', metadata: {} });
-  tree.addEdge({ id: 'e-fast-fail', sourceId: 'fast-check', targetId: 'fast-fail', metadata: {} });
+  tree.addEdge({ id: 'e-fast-fail', sourceId: 'fast-check', targetId: 'validate', condition: 'Fast failed — fall back to careful path', metadata: {} });
 
   tree.addEdge({ id: 'e-validate-to-process', sourceId: 'validate', targetId: 'careful-process', metadata: {} });
   tree.addEdge({ id: 'e-careful-to-check', sourceId: 'careful-process', targetId: 'careful-check', metadata: {} });
@@ -121,7 +122,7 @@ export function buildSpeedVsAccuracy(): ScenarioDefinition {
 
   return {
     name: 'Speed vs Accuracy',
-    description: 'Fast path (70% fail) vs careful path (5% fail). Tests whether recommendations steer away from the obvious-but-unreliable choice.',
+    description: 'Fast path (70% fail, cascades to careful) vs careful path (5% fail). Recommendations should learn that careful-direct is shorter than fast→fail→careful.',
     tree,
     toolHandlers,
     conditionEvaluators: conditionEvaluators as Map<string, (ctx: { variables: Record<string, unknown> }) => boolean>,
