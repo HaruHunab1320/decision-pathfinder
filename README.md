@@ -157,17 +157,36 @@ const { dropped, summary } = await store.compact('my-task');
 const { sessions, compacted } = await store.loadWithAutoCompact('my-task');
 ```
 
-### Multi-process safety
+### SQLite backend
 
-All session writes use advisory file locking — safe for multiple MCP server processes on one machine:
+For heavier workloads or concurrent access, use the SQLite backend instead of JSONL:
 
 ```typescript
-import { withLock } from 'decision-pathfinder';
+import { SqliteSessionStore } from 'decision-pathfinder';
 
-await withLock('/path/to/file', async () => {
-  // exclusive access
-});
+const store = new SqliteSessionStore();  // ~/.decision-pathfinder/sessions/sessions.db
+// Same API as SessionStore — drop-in replacement
 ```
+
+In the MCP server, set `DP_STORE_BACKEND=sqlite`:
+
+```json
+{
+  "mcpServers": {
+    "decision-pathfinder": {
+      "command": "npx",
+      "args": ["decision-pathfinder-mcp"],
+      "env": { "DP_STORE_BACKEND": "sqlite" }
+    }
+  }
+}
+```
+
+Uses WAL mode for concurrent reads + writes — no file locking needed.
+
+### Multi-process safety
+
+The JSONL backend uses advisory file locking — safe for multiple MCP server processes on one machine. The SQLite backend handles concurrency natively via WAL mode.
 
 ## Node types
 
@@ -178,6 +197,7 @@ await withLock('/path/to/file', async () => {
 | `ConditionalNode` | Branch on a condition | `condition`, `evaluator`, `trueEdgeId`, `falseEdgeId` |
 | `SuccessNode` | Terminal success | `message`, `resultData` |
 | `FailureNode` | Terminal failure | `message`, `errorCode`, `recoverable`, `suggestedAction` |
+| `SubTreeNode` | Delegate to another tree | `treeId`, `startNodeId`, `inputVariables`, `maxSteps` |
 
 ## Recommendation engine
 
@@ -230,6 +250,58 @@ const restored = serializer.fromJSON(json);
 // Custom node types
 serializer.registerNodeType('custom', (s) => new MyCustomNode(s.id, s.label, s.data));
 ```
+
+## Tree composition
+
+Break large workflows into reusable sub-trees:
+
+```typescript
+import { SubTreeNode, TreeExecutor } from 'decision-pathfinder';
+
+// Parent tree references a sub-tree by ID
+tree.addNode(new SubTreeNode('deploy-step', 'Deploy', {
+  treeId: 'deploy-staging',    // resolved at runtime
+  maxSteps: 30,
+}));
+
+// Provide a resolver so the executor can look up trees
+const executor = new TreeExecutor(tree, adapter, tracker, {
+  treeResolver: async (treeId) => {
+    const subTree = loadTree(treeId);  // your lookup logic
+    return subTree ? { tree: subTree, tracker: subTracker } : null;
+  },
+});
+
+const result = await executor.execute('start');
+// result.variables['subtree_deploy-staging'] contains the sub-tree's output
+```
+
+Sub-trees can nest (a sub-tree can contain `SubTreeNode`s), variables merge back into the parent, and token usage accumulates across the chain.
+
+## Streaming execution
+
+Watch tree execution live:
+
+```typescript
+import { ExecutionStream } from 'decision-pathfinder';
+
+const stream = new ExecutionStream(tree, adapter, tracker, config);
+for await (const event of stream.execute('start')) {
+  switch (event.type) {
+    case 'step_start':
+      console.log(`→ ${event.nodeLabel}`);
+      break;
+    case 'tool_call':
+      console.log(`  tool: ${event.toolName}`);
+      break;
+    case 'complete':
+      console.log(`done: ${event.result.status}`);
+      break;
+  }
+}
+```
+
+Events: `step_start`, `step_complete`, `tool_call`, `condition`, `complete`, `error`.
 
 ## MCP Server
 
@@ -381,7 +453,7 @@ Everything runs locally. Trees, history, and recommendations stay on your machin
 
 ```bash
 npm run build      # compile to dist/
-npm run test       # 183 tests
+npm run test       # 207 tests
 npm run lint       # biome check
 npm run demo       # tree-driven README generator using Gemini
 npm run benchmark  # cross-model benchmark harness (flash-lite vs flash vs pro)
