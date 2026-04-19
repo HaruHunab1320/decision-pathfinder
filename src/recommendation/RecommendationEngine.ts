@@ -38,6 +38,15 @@ export interface EdgeRecommendation {
   }>;
 }
 
+export interface RecommendationEngineOptions {
+  /**
+   * Half-life for session age decay in days. Sessions older than this
+   * contribute half as much as brand-new sessions. Set to 0 or Infinity
+   * to disable decay. Default: 30 days.
+   */
+  decayHalfLifeDays?: number;
+}
+
 export class RecommendationEngine {
   /**
    * Extra sessions (e.g. from family-sibling trees) to merge with the
@@ -45,10 +54,38 @@ export class RecommendationEngine {
    */
   pooledSessions: EnhancedPathRecord[][] = [];
 
+  private decayHalfLifeDays: number;
+
   constructor(
     private tree: IDecisionTree,
     private tracker: IEnhancedPathTracker,
-  ) {}
+    options?: RecommendationEngineOptions,
+  ) {
+    this.decayHalfLifeDays = options?.decayHalfLifeDays ?? 30;
+  }
+
+  /**
+   * Compute age-based weight for a session. Uses exponential decay:
+   * weight = exp(-days_old * ln(2) / halfLife)
+   *
+   * A session exactly halfLife days old gets weight 0.5.
+   * A brand-new session gets weight 1.0.
+   * Disabled (weight always 1.0) when halfLife is 0 or Infinity.
+   */
+  private sessionAgeWeight(session: EnhancedPathRecord[]): number {
+    if (
+      this.decayHalfLifeDays <= 0 ||
+      !Number.isFinite(this.decayHalfLifeDays)
+    ) {
+      return 1;
+    }
+    const firstRecord = session[0];
+    if (!firstRecord) return 1;
+    const ageMs = Date.now() - firstRecord.timestamp;
+    const ageDays = ageMs / (1000 * 60 * 60 * 24);
+    if (ageDays <= 0) return 1;
+    return Math.exp((-ageDays * Math.LN2) / this.decayHalfLifeDays);
+  }
 
   /** All sessions: tracker-owned + pooled from family siblings. */
   private getAllSessions(): EnhancedPathRecord[][] {
@@ -214,15 +251,15 @@ export class RecommendationEngine {
 
     const sessions = this.getAllSessions();
 
-    // For each outgoing edge target, track how often sessions that went through
-    // that target were successful, and the lengths of those successful sessions
+    // For each outgoing edge target, track weighted success/total counts.
+    // Each session's contribution is scaled by its age weight (recent = ~1, old = decayed).
     const edgeOutcomes = new Map<
       string,
       {
         edgeId: string;
         targetNodeId: NodeId;
-        successes: number;
-        total: number;
+        successes: number; // weighted sum
+        total: number; // weighted sum
         successfulLengths: number[];
       }
     >();
@@ -248,6 +285,8 @@ export class RecommendationEngine {
     }
 
     for (const session of sessions) {
+      const weight = this.sessionAgeWeight(session);
+
       for (let i = 0; i < session.length - 1; i++) {
         const record = session[i] as EnhancedPathRecord;
         const nextRecord = session[i + 1] as EnhancedPathRecord;
@@ -258,14 +297,14 @@ export class RecommendationEngine {
             if (edge.targetId === nextRecord.nodeId) {
               const outcomes = edgeOutcomes.get(edge.id);
               if (outcomes) {
-                outcomes.total++;
+                outcomes.total += weight;
                 // Check if the rest of the session from this point was successful
                 const remainingRecords = session.slice(i + 1);
                 const allSuccessful = remainingRecords.every(
                   (r) => r.status === 'success' || r.status === 'pending',
                 );
                 if (allSuccessful) {
-                  outcomes.successes++;
+                  outcomes.successes += weight;
                   outcomes.successfulLengths.push(session.length);
                 }
               }

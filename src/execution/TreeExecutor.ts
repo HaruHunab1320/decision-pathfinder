@@ -7,11 +7,17 @@ import type {
   NodeId,
 } from '../core/interfaces.js';
 
+/** Token usage from a single LLM call. */
+export interface TokenUsage {
+  inputTokens?: number;
+  outputTokens?: number;
+}
+
 // Decision maker interface — the executor calls this to choose an edge
 export interface IDecisionMaker {
   decide(
     context: DecisionContext,
-  ): Promise<{ chosenEdgeId: string; reasoning?: string }>;
+  ): Promise<{ chosenEdgeId: string; reasoning?: string; tokenUsage?: TokenUsage }>;
 }
 
 // Tool handler function signature
@@ -64,6 +70,10 @@ export interface ExecutionResult {
   variables: Record<string, unknown>;
   stepCount: number;
   error?: string;
+  /** Cumulative token usage across all LLM calls in this execution. */
+  totalTokenUsage?: TokenUsage;
+  /** Number of LLM calls made during this execution. */
+  llmCallCount?: number;
 }
 
 export class TreeExecutor {
@@ -74,6 +84,9 @@ export class TreeExecutor {
   private toolHandlers: Map<string, ToolHandler>;
   private conditionEvaluators: Map<string, ConditionEvaluator>;
   private events: ExecutionEvents;
+  private totalInputTokens = 0;
+  private totalOutputTokens = 0;
+  private llmCallCount = 0;
 
   constructor(
     tree: IDecisionTree,
@@ -120,9 +133,15 @@ export class TreeExecutor {
 
         // Terminal nodes
         if (node.type === 'success' || node.type === 'failure') {
+          const failureData = node.type === 'failure'
+            ? (node as INode & { data?: { message?: string } }).data
+            : undefined;
           this.tracker.recordEnhancedVisit(
             node.id,
             node.type === 'success' ? 'success' : 'failure',
+            node.type === 'failure' && failureData?.message
+              ? { error: failureData.message }
+              : undefined,
           );
           this.tracker.endSession();
 
@@ -133,6 +152,7 @@ export class TreeExecutor {
             pathTaken: context.pathHistory,
             variables: context.variables,
             stepCount: context.stepCount + 1,
+            ...this.getTokenUsageFields(),
           };
           this.events.onComplete?.(result);
           return result;
@@ -155,6 +175,7 @@ export class TreeExecutor {
         variables: context.variables,
         stepCount: context.stepCount,
         error: `Execution exceeded maximum steps (${this.maxSteps})`,
+        ...this.getTokenUsageFields(),
       };
       this.events.onComplete?.(result);
       return result;
@@ -168,10 +189,25 @@ export class TreeExecutor {
         status: 'error',
         pathTaken: context.pathHistory,
         variables: context.variables,
+        ...this.getTokenUsageFields(),
         stepCount: context.stepCount,
         error: error.message,
       };
     }
+  }
+
+  private getTokenUsageFields(): Pick<ExecutionResult, 'totalTokenUsage' | 'llmCallCount'> {
+    const result: Pick<ExecutionResult, 'totalTokenUsage' | 'llmCallCount'> = {};
+    if (this.totalInputTokens > 0 || this.totalOutputTokens > 0) {
+      result.totalTokenUsage = {
+        inputTokens: this.totalInputTokens,
+        outputTokens: this.totalOutputTokens,
+      };
+    }
+    if (this.llmCallCount > 0) {
+      result.llmCallCount = this.llmCallCount;
+    }
+    return result;
   }
 
   private async processNode(
@@ -317,6 +353,13 @@ export class TreeExecutor {
     };
 
     const decision = await this.decisionMaker.decide(decisionContext);
+
+    // Track token usage
+    if (decision.tokenUsage) {
+      this.totalInputTokens += decision.tokenUsage.inputTokens ?? 0;
+      this.totalOutputTokens += decision.tokenUsage.outputTokens ?? 0;
+    }
+    this.llmCallCount++;
 
     // Validate chosen edge
     const chosenEdge = outgoingEdges.find(

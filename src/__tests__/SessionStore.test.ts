@@ -124,4 +124,120 @@ describe('SessionStore', () => {
     const loaded = await store.load(safeId);
     expect(loaded).toHaveLength(1);
   });
+
+  describe('compaction', () => {
+    it('compacts old sessions and keeps recent ones', async () => {
+      const compactStore = new SessionStore(dir, {
+        maxSessionsPerTree: 100,
+        retainRecent: 3,
+      });
+
+      for (let i = 0; i < 10; i++) {
+        await compactStore.append('tree-1', makeSession(3, i < 7 ? 'success' : 'failure'));
+      }
+
+      const result = await compactStore.compact('tree-1', 3);
+      expect(result.dropped).toBe(7);
+      expect(result.summary).not.toBeNull();
+      expect(result.summary!.droppedSessions).toBe(7);
+      expect(result.summary!.successCount).toBe(7);
+      expect(result.summary!.failureCount).toBe(0);
+
+      const remaining = await compactStore.load('tree-1');
+      expect(remaining).toHaveLength(3);
+    });
+
+    it('does nothing when session count is below retain threshold', async () => {
+      for (let i = 0; i < 5; i++) {
+        await store.append('tree-1', makeSession());
+      }
+
+      const result = await store.compact('tree-1', 10);
+      expect(result.dropped).toBe(0);
+      expect(result.summary).toBeNull();
+
+      const loaded = await store.load('tree-1');
+      expect(loaded).toHaveLength(5);
+    });
+
+    it('merges compaction summaries across multiple compactions', async () => {
+      for (let i = 0; i < 10; i++) {
+        await store.append('tree-1', makeSession());
+      }
+      await store.compact('tree-1', 5); // drop 5
+
+      for (let i = 0; i < 10; i++) {
+        await store.append('tree-1', makeSession());
+      }
+      const result = await store.compact('tree-1', 5); // drop 10 more
+
+      expect(result.summary!.droppedSessions).toBe(15); // 5 + 10
+    });
+
+    it('writes compaction summary to sidecar file', async () => {
+      for (let i = 0; i < 10; i++) {
+        await store.append('tree-1', makeSession());
+      }
+      await store.compact('tree-1', 3);
+
+      const summary = await store.getCompactionSummary('tree-1');
+      expect(summary).not.toBeNull();
+      expect(summary!.droppedSessions).toBe(7);
+    });
+  });
+
+  describe('rotation', () => {
+    it('moves the session file to a timestamped archive', async () => {
+      await store.append('tree-1', makeSession());
+      await store.append('tree-1', makeSession());
+
+      const archivePath = await store.rotate('tree-1');
+      expect(archivePath).not.toBeNull();
+      expect(fs.existsSync(archivePath!)).toBe(true);
+      expect(archivePath!).toContain('.archive.jsonl');
+
+      // Original file should be gone
+      const loaded = await store.load('tree-1');
+      expect(loaded).toHaveLength(0);
+    });
+
+    it('returns null when no file exists', async () => {
+      const result = await store.rotate('nonexistent');
+      expect(result).toBeNull();
+    });
+  });
+
+  describe('loadWithAutoCompact', () => {
+    it('auto-compacts when session count exceeds threshold', async () => {
+      const compactStore = new SessionStore(dir, {
+        maxSessionsPerTree: 5,
+        retainRecent: 3,
+      });
+
+      for (let i = 0; i < 8; i++) {
+        await compactStore.append('tree-1', makeSession());
+      }
+
+      const { sessions, compacted } =
+        await compactStore.loadWithAutoCompact('tree-1');
+      expect(compacted).toBe(true);
+      expect(sessions).toHaveLength(3);
+    });
+
+    it('skips compaction when under threshold', async () => {
+      const compactStore = new SessionStore(dir, {
+        maxSessionsPerTree: 100,
+        retainRecent: 50,
+      });
+
+      for (let i = 0; i < 5; i++) {
+        await compactStore.append('tree-1', makeSession());
+      }
+
+      const { sessions, compacted } =
+        await compactStore.loadWithAutoCompact('tree-1');
+      expect(compacted).toBe(false);
+      expect(sessions).toHaveLength(5);
+    });
+  });
 });

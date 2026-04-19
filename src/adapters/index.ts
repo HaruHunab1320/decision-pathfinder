@@ -6,4 +6,5 @@ export type { GeminiAdapterConfig } from './GeminiAdapter.js';
 export { GeminiAdapter } from './GeminiAdapter.js';
 export type { OpenAIAdapterConfig } from './OpenAIAdapter.js';
 export { OpenAIAdapter } from './OpenAIAdapter.js';
+export { isSamplingAvailable, SamplingAdapter } from './SamplingAdapter.js';
 export type { DecisionContext } from './types.js';

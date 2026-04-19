@@ -59,12 +59,16 @@ export class PersistentPathTracker extends PathTracker {
 
     if (justEnded.length > 0) {
       const finalStatus = this.deriveFinalStatus(justEnded);
+      const failureReason = this.extractFailureReason(justEnded, finalStatus);
       const persistedSession: PersistedSession = {
         timestamp: new Date().toISOString(),
         records: justEnded,
         finalStatus,
         stepCount: justEnded.length,
       };
+      if (failureReason !== undefined) {
+        persistedSession.failureReason = failureReason;
+      }
 
       this.lastPersistPromise = this.store
         .append(this.treeId, persistedSession)
@@ -81,5 +85,22 @@ export class PersistentPathTracker extends PathTracker {
     if (records.length === 0) return 'pending';
     const last = records[records.length - 1]!;
     return last.status;
+  }
+
+  /**
+   * Extract a human-readable failure reason from a session's records.
+   * Looks for the last record with an error field, or the terminal failure node.
+   */
+  private extractFailureReason(
+    records: EnhancedPathRecord[],
+    finalStatus: FinalStatus,
+  ): string | undefined {
+    if (finalStatus !== 'failure' && finalStatus !== 'error') return undefined;
+    // Walk backwards to find the most specific error
+    for (let i = records.length - 1; i >= 0; i--) {
+      const record = records[i]!;
+      if (record.error) return record.error;
+    }
+    return undefined;
   }
 }

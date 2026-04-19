@@ -286,3 +286,145 @@ describe('RecommendationEngine — family-pooled sessions', () => {
     expect(engine.analyzeHistory().totalSessions).toBe(1);
   });
 });
+
+describe('RecommendationEngine — confidence decay', () => {
+  const DAY_MS = 1000 * 60 * 60 * 24;
+
+  function makeSession(
+    nodeIds: string[],
+    finalStatus: 'success' | 'failure',
+    ageInDays: number,
+  ): import('../core/interfaces.js').EnhancedPathRecord[] {
+    const baseTimestamp = Date.now() - ageInDays * DAY_MS;
+    return nodeIds.map((nodeId, i) => ({
+      nodeId,
+      timestamp: baseTimestamp + i,
+      metadata: {},
+      status:
+        i === nodeIds.length - 1
+          ? finalStatus
+          : ('success' as const),
+    }));
+  }
+
+  it('recent sessions outweigh older sessions with same success rate', () => {
+    const tree = new DecisionTree();
+    const tracker = new PathTracker();
+
+    tree.addNode(node('start'));
+    tree.addNode(node('A'));
+    tree.addNode(node('B'));
+    tree.addNode(node('end'));
+    tree.addEdge(edge('e-start-A', 'start', 'A'));
+    tree.addEdge(edge('e-start-B', 'start', 'B'));
+    tree.addEdge(edge('e-A-end', 'A', 'end'));
+    tree.addEdge(edge('e-B-end', 'B', 'end'));
+
+    // 10 old sessions (90 days ago) favoring path A
+    // 5 recent sessions (1 day ago) favoring path B
+    const engine = new RecommendationEngine(tree, tracker, {
+      decayHalfLifeDays: 30,
+    });
+
+    engine.pooledSessions = [
+      ...Array.from({ length: 10 }, () =>
+        makeSession(['start', 'A', 'end'], 'success', 90),
+      ),
+      ...Array.from({ length: 5 }, () =>
+        makeSession(['start', 'B', 'end'], 'success', 1),
+      ),
+    ];
+
+    const rec = engine.getEdgeRecommendation('start');
+    expect(rec).not.toBeNull();
+    // B should win despite fewer sessions — recency matters
+    expect(rec!.recommendedEdgeId).toBe('e-start-B');
+  });
+
+  it('decay disabled when halfLife is 0 — all sessions equal', () => {
+    const tree = new DecisionTree();
+    const tracker = new PathTracker();
+
+    tree.addNode(node('start'));
+    tree.addNode(node('A'));
+    tree.addNode(node('B'));
+    tree.addNode(node('end'));
+    tree.addEdge(edge('e-start-A', 'start', 'A'));
+    tree.addEdge(edge('e-start-B', 'start', 'B'));
+    tree.addEdge(edge('e-A-end', 'A', 'end'));
+    tree.addEdge(edge('e-B-end', 'B', 'end'));
+
+    const engine = new RecommendationEngine(tree, tracker, {
+      decayHalfLifeDays: 0,
+    });
+
+    engine.pooledSessions = [
+      ...Array.from({ length: 10 }, () =>
+        makeSession(['start', 'A', 'end'], 'success', 90),
+      ),
+      ...Array.from({ length: 5 }, () =>
+        makeSession(['start', 'B', 'end'], 'success', 1),
+      ),
+    ];
+
+    const rec = engine.getEdgeRecommendation('start');
+    expect(rec).not.toBeNull();
+    // A should win — more raw sessions, no decay
+    expect(rec!.recommendedEdgeId).toBe('e-start-A');
+  });
+
+  it('sessions at exactly halfLife age get ~50% weight', () => {
+    const tree = new DecisionTree();
+    const tracker = new PathTracker();
+
+    tree.addNode(node('start'));
+    tree.addNode(node('A'));
+    tree.addNode(node('end'));
+    tree.addEdge(edge('e1', 'start', 'A'));
+    tree.addEdge(edge('e2', 'A', 'end'));
+
+    const engine = new RecommendationEngine(tree, tracker, {
+      decayHalfLifeDays: 30,
+    });
+
+    // Access the private method via any for testing
+    const session = makeSession(['start', 'A', 'end'], 'success', 30);
+    const weight = (engine as any).sessionAgeWeight(session);
+    expect(weight).toBeCloseTo(0.5, 1);
+  });
+
+  it('very old sessions have near-zero weight', () => {
+    const tree = new DecisionTree();
+    const tracker = new PathTracker();
+
+    tree.addNode(node('start'));
+    tree.addNode(node('end'));
+    tree.addEdge(edge('e1', 'start', 'end'));
+
+    const engine = new RecommendationEngine(tree, tracker, {
+      decayHalfLifeDays: 30,
+    });
+
+    const session = makeSession(['start', 'end'], 'success', 365);
+    const weight = (engine as any).sessionAgeWeight(session);
+    // 365/30 ≈ 12 half-lives → weight ≈ 2^(-12) �� 0.0002
+    expect(weight).toBeLessThan(0.001);
+  });
+
+  it('brand-new sessions get weight 1.0', () => {
+    const tree = new DecisionTree();
+    const tracker = new PathTracker();
+
+    tree.addNode(node('start'));
+    tree.addNode(node('end'));
+    tree.addEdge(edge('e1', 'start', 'end'));
+
+    const engine = new RecommendationEngine(tree, tracker, {
+      decayHalfLifeDays: 30,
+    });
+
+    const session = makeSession(['start', 'end'], 'success', 0);
+    const weight = (engine as any).sessionAgeWeight(session);
+    expect(weight).toBeCloseTo(1.0, 2);
+  });
+});

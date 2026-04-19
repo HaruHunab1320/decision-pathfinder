@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-04-18
+
+### Added
+
+- **Confidence decay** (#3): Session age weighting via `exp(-days × ln2 / halfLife)`.
+  Recent sessions dominate recommendations; stale history fades. Configurable
+  `decayHalfLifeDays` (default 30). Set to 0 or Infinity to disable.
+- **Session rotation & compaction** (#4): `SessionStore.compact()` retains the
+  most recent N sessions and writes a compaction summary. `rotate()` archives
+  the file. `loadWithAutoCompact()` auto-triggers when threshold is exceeded.
+  Sidecar `.compaction.json` tracks cumulative stats across multiple compactions.
+- **Export/import with history** (#5): `dp_export_tree` now accepts
+  `includeHistory` to bundle tree + sessions + compaction summary. New
+  `dp_import_tree` tool restores the tree, metadata, and optionally all session
+  history — enables teammate onboarding from a single file.
+- **Multi-process safety** (#6): File-lock wrapper (`FileLock` / `withLock`)
+  around session appends, compaction writes, and rotation. Uses exclusive-create
+  + stale-lock detection. Safe for multiple MCP server processes on one machine.
+- **Failure reason extraction** (#7): `PersistedSession.failureReason` captures
+  why a session failed (from the terminal node's error message or the last
+  record with an error). `dp_get_history_summary` now returns `topFailureReasons`
+  (deduplicated, ranked by frequency).
+- **Cost tracking** (#8): `TokenUsage` type (`inputTokens`, `outputTokens`) on
+  `IDecisionMaker.decide()` return values. `TreeExecutor` accumulates totals and
+  exposes `totalTokenUsage` + `llmCallCount` on `ExecutionResult`. Surfaced in
+  `dp_execute_tree` responses.
+- **Tree evolution** (#9): `TreeEvolution` analyzer proposes structural edits
+  based on session patterns — skippable nodes, shortcut edges, bottleneck flags,
+  and edge reordering. New `dp_suggest_edits` MCP tool with configurable
+  confidence threshold.
+- **Agent-driven MCP mode** (#10): `dp_start_execution` + `dp_step` tools let
+  the calling agent make every decision step-by-step. No internal LLM is called.
+  Recommendations are provided as hints. Sessions are still recorded for future
+  learning.
+- **MCP sampling support** (#11): `SamplingAdapter` uses `sampling/createMessage`
+  to delegate decisions to the host LLM — zero-config, no API keys needed.
+  Auto-detected at connection time; highest priority in provider selection.
+  Set `DP_NO_SAMPLING=1` to opt out.
+
 ## [1.1.0] - 2026-04-18
 
 ### Added
@@ -59,5 +98,6 @@ Initial public release.
 - Persistent JSONL session store with recommendation caching
 - Benchmark harness with 7 scenario types
 
+[1.2.0]: https://github.com/HaruHunab1320/decision-pathfinder/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/HaruHunab1320/decision-pathfinder/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/HaruHunab1320/decision-pathfinder/releases/tag/v1.0.0

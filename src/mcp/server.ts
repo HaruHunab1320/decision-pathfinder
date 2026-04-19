@@ -20,18 +20,26 @@
  *     dp_execute_tree      — Execute a tree (auto-uses recommendations)
  *     dp_get_recommendation — Get edge recommendation at a node
  *     dp_get_analytics     — Get execution analytics and bottleneck report
+ *     dp_suggest_edits    — Propose structural improvements from session analysis
+ *     dp_start_execution   — Begin agent-driven step-by-step execution
+ *     dp_step              — Advance agent-driven execution by choosing an edge
+ *     dp_suggest_edits    — Propose structural improvements from session analysis
  *     dp_find_tree         — Search for trees by task description
- *     dp_export_tree       — Export a tree to JSON
+ *     dp_export_tree       — Export a tree to JSON (optionally with history)
+ *     dp_import_tree       — Import a tree (optionally with history)
  *
  * Session persistence: Completed executions are appended to JSONL files at
  * ~/.decision-pathfinder/sessions/{treeId}.jsonl, so recommendations
  * accumulate across process restarts.
  *
- * LLM provider auto-detection: checks env vars in priority order
- *   ANTHROPIC_API_KEY → Claude (claude-haiku-4-5)
- *   OPENAI_API_KEY    → OpenAI (gpt-4o-mini)
- *   GEMINI_API_KEY    → Gemini (gemini-2.0-flash-lite)
- *   none              → MockDecisionMaker (picks first edge)
+ * LLM provider auto-detection (priority order):
+ *   1. MCP sampling    → Host LLM (zero-config, no API keys needed)
+ *   2. ANTHROPIC_API_KEY → Claude (claude-haiku-4-5)
+ *   3. OPENAI_API_KEY    → OpenAI (gpt-4o-mini)
+ *   4. GEMINI_API_KEY    → Gemini (gemini-2.0-flash-lite)
+ *   5. none              → MockDecisionMaker (picks first edge)
+ *
+ * Set DP_NO_SAMPLING=1 to skip MCP sampling even if the host supports it.
  *
  * Override model with DP_MODEL (all providers) or provider-specific vars:
  *   ANTHROPIC_MODEL, OPENAI_MODEL, GEMINI_MODEL.
@@ -43,6 +51,10 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { ClaudeAdapter } from '../adapters/ClaudeAdapter.js';
+import {
+  isSamplingAvailable,
+  SamplingAdapter,
+} from '../adapters/SamplingAdapter.js';
 import { GeminiAdapter } from '../adapters/GeminiAdapter.js';
 import { OpenAIAdapter } from '../adapters/OpenAIAdapter.js';
 import { DecisionTree } from '../core/DecisionTree.js';
@@ -59,6 +71,7 @@ import {
   TreeIndex,
 } from '../persistence/index.js';
 import { RecommendationEngine } from '../recommendation/RecommendationEngine.js';
+import { TreeEvolution } from '../recommendation/TreeEvolution.js';
 import { TreeSerializer } from '../serialization/TreeSerializer.js';
 import { PathTracker } from '../tracking/PathTracker.js';
 
@@ -86,13 +99,31 @@ interface RecordingState {
   startedAt: string;
 }
 
+/** State for agent-driven step-by-step execution. */
+interface StepExecutionState {
+  executionId: string;
+  treeId: string;
+  tree: DecisionTree;
+  tracker: import('../tracking/PathTracker.js').PathTracker;
+  currentNodeId: string;
+  pathHistory: string[];
+  variables: Record<string, unknown>;
+  stepCount: number;
+  maxSteps: number;
+  startedAt: string;
+  status: 'active' | 'completed';
+}
+
 const trees = new Map<string, TreeState>();
 const recordings = new Map<string, RecordingState>();
+const stepExecutions = new Map<string, StepExecutionState>();
 const serializer = new TreeSerializer();
 const sessionStore = new SessionStore(
   process.env.DECISION_PATHFINDER_STORE || undefined,
 );
 const treeIndex = new TreeIndex(sessionStore.getStoreDir());
+// Sampling adapter — initialized after connection if client supports it
+let samplingAdapter: SamplingAdapter | null = null;
 
 async function createPersistentTracker(treeId: string): Promise<{
   tracker: PersistentPathTracker;
@@ -125,19 +156,27 @@ async function loadFamilySessions(
 }
 
 interface SelectedProvider {
-  name: 'claude' | 'openai' | 'gemini' | 'mock';
+  name: 'sampling' | 'claude' | 'openai' | 'gemini' | 'mock';
   adapter: IDecisionMaker;
   modelName?: string;
 }
 
 /**
- * Select an LLM provider based on which API keys are present in the environment.
- * Priority: ANTHROPIC_API_KEY > OPENAI_API_KEY > GEMINI_API_KEY > mock.
+ * Select an LLM provider. Priority:
+ *   1. MCP sampling (if host supports it and DP_NO_SAMPLING is not set)
+ *   2. ANTHROPIC_API_KEY → Claude
+ *   3. OPENAI_API_KEY → OpenAI
+ *   4. GEMINI_API_KEY → Gemini
+ *   5. Mock (picks first edge)
  *
- * Model can be overridden with DP_MODEL env var (or provider-specific vars:
- * ANTHROPIC_MODEL, OPENAI_MODEL, GEMINI_MODEL).
+ * Model can be overridden with DP_MODEL env var (or provider-specific vars).
  */
 function selectProvider(): SelectedProvider {
+  // Prefer MCP sampling if available — zero-config, no API keys needed
+  if (!process.env.DP_NO_SAMPLING && samplingAdapter) {
+    return { name: 'sampling', adapter: samplingAdapter, modelName: 'host' };
+  }
+
   const anthropic = process.env.ANTHROPIC_API_KEY;
   const openai = process.env.OPENAI_API_KEY;
   const gemini = process.env.GEMINI_API_KEY;
@@ -217,7 +256,7 @@ function errorResponse(msg: string) {
 
 const server = new McpServer({
   name: 'decision-pathfinder',
-  version: '1.1.0',
+  version: '1.2.0',
 });
 
 // ─── Tool: Start Recording ────────────────────────────────────────────────────
@@ -701,6 +740,21 @@ server.registerTool(
           ? successLengths.reduce((a, b) => a + b, 0) / successLengths.length
           : null;
 
+      // Extract failure reasons (deduplicated, most common first)
+      const failureReasonCounts = new Map<string, number>();
+      for (const s of persisted) {
+        if (s.failureReason) {
+          failureReasonCounts.set(
+            s.failureReason,
+            (failureReasonCounts.get(s.failureReason) ?? 0) + 1,
+          );
+        }
+      }
+      const topFailureReasons = [...failureReasonCounts.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 5)
+        .map(([reason, count]) => ({ reason, count }));
+
       return jsonResponse({
         treeId: args.treeId,
         hasHistory: persisted.length > 0,
@@ -711,6 +765,7 @@ server.registerTool(
         successRate: persisted.length > 0 ? successCount / persisted.length : 0,
         shortestSuccessfulSteps: shortestSuccess,
         averageSuccessfulSteps: avgSuccess,
+        topFailureReasons,
         mostRecentSession:
           persisted.length > 0
             ? persisted[persisted.length - 1]!.timestamp
@@ -822,6 +877,8 @@ server.registerTool(
         familySessionsPooled: familySessions.length,
         provider: provider.name,
         model: provider.modelName,
+        llmCallCount: result.llmCallCount,
+        totalTokenUsage: result.totalTokenUsage,
       });
     } catch (err) {
       return errorResponse(`Execution failed: ${(err as Error).message}`);
@@ -922,6 +979,64 @@ server.registerTool(
   },
 );
 
+// ─── Tool: Suggest Edits ─────────────────────────────────────────────────────
+
+server.registerTool(
+  'dp_suggest_edits',
+  {
+    title: 'Suggest Tree Edits',
+    description:
+      'Analyze session history and propose structural improvements to the tree. Finds skippable nodes, shortcut opportunities, bottlenecks, and edge reordering suggestions.',
+    inputSchema: {
+      treeId: z.string().describe('ID of the loaded tree'),
+      minConfidence: z
+        .number()
+        .optional()
+        .describe(
+          'Minimum confidence threshold for suggestions (0-1). Default: 0.5',
+        ),
+    },
+  },
+  async (args) => {
+    try {
+      const state = getTree(args.treeId);
+      const evolution = new TreeEvolution(state.tree, state.tracker);
+      evolution.setPooledSessions(await loadFamilySessions(args.treeId));
+      const allSuggestions = evolution.analyze();
+
+      const minConf = args.minConfidence ?? 0.5;
+      const filtered = allSuggestions.filter((s) => s.confidence >= minConf);
+
+      if (filtered.length === 0) {
+        return jsonResponse({
+          treeId: args.treeId,
+          suggestions: [],
+          message:
+            allSuggestions.length > 0
+              ? `Found ${allSuggestions.length} suggestion(s) but none above confidence ${minConf}. Lower minConfidence to see them.`
+              : 'No suggestions yet — need more session history.',
+        });
+      }
+
+      return jsonResponse({
+        treeId: args.treeId,
+        suggestions: filtered.map((s) => ({
+          type: s.type,
+          nodeId: s.nodeId,
+          fromNodeId: s.fromNodeId,
+          toNodeId: s.toNodeId,
+          confidence: s.confidence,
+          reasoning: s.reasoning,
+          evidence: s.evidence,
+        })),
+        message: `Found ${filtered.length} suggestion(s) for improving tree "${args.treeId}".`,
+      });
+    } catch (err) {
+      return errorResponse((err as Error).message);
+    }
+  },
+);
+
 // ─── Tool: Find Tree ─────────────────────────────────────────────────────────
 
 server.registerTool(
@@ -983,30 +1098,306 @@ server.registerTool(
   },
 );
 
+// ─── Tool: Start Execution (Agent-Driven) ────────────────────────────────────
+
+server.registerTool(
+  'dp_start_execution',
+  {
+    title: 'Start Agent-Driven Execution',
+    description:
+      'Start a step-by-step tree execution where YOU (the calling agent) make every decision. No LLM is called internally. Returns the first decision context. Use dp_step to advance.',
+    inputSchema: {
+      treeId: z.string().describe('ID of the loaded tree'),
+      startNodeId: z
+        .string()
+        .optional()
+        .describe('Node ID to start from. Defaults to first root node.'),
+      maxSteps: z.number().optional().describe('Max steps. Default: 50'),
+    },
+  },
+  async (args) => {
+    try {
+      const state = getTree(args.treeId);
+      const { tree, tracker } = state;
+      const startNodeId = args.startNodeId ?? tree.getRootNodes()[0]?.id;
+      if (!startNodeId) return errorResponse('Tree has no root nodes');
+
+      const node = tree.getNode(startNodeId);
+      if (!node) return errorResponse(`Node "${startNodeId}" not found`);
+
+      const executionId = `exec-${Date.now()}-${slugify(args.treeId)}`;
+      tracker.startSession();
+
+      const execState: StepExecutionState = {
+        executionId,
+        treeId: args.treeId,
+        tree,
+        tracker,
+        currentNodeId: startNodeId,
+        pathHistory: [startNodeId],
+        variables: {},
+        stepCount: 0,
+        maxSteps: args.maxSteps ?? 50,
+        startedAt: new Date().toISOString(),
+        status: 'active',
+      };
+      stepExecutions.set(executionId, execState);
+
+      // Check if terminal
+      if (node.type === 'success' || node.type === 'failure') {
+        tracker.recordEnhancedVisit(
+          node.id,
+          node.type === 'success' ? 'success' : 'failure',
+        );
+        tracker.endSession();
+        execState.status = 'completed';
+        return jsonResponse({
+          executionId,
+          status: node.type,
+          finalNode: { id: node.id, type: node.type, label: node.label },
+          pathTaken: execState.pathHistory,
+          stepCount: 0,
+        });
+      }
+
+      // Return decision context
+      const outgoing = tree.getOutgoingEdges(startNodeId);
+      const recommendation = tracker.getAllSessions().length > 0
+        ? new RecommendationEngine(tree, tracker).getEdgeRecommendation(startNodeId)
+        : null;
+
+      return jsonResponse({
+        executionId,
+        status: 'awaiting_decision',
+        currentNode: { id: node.id, type: node.type, label: node.label },
+        availableEdges: outgoing.map((e) => ({
+          edgeId: e.id,
+          targetNodeId: e.targetId,
+          targetLabel: tree.getNode(e.targetId)?.label,
+          condition: e.condition,
+        })),
+        recommendation: recommendation
+          ? {
+              edgeId: recommendation.recommendedEdgeId,
+              confidence: recommendation.confidence,
+              reasoning: recommendation.reasoning,
+            }
+          : null,
+        pathHistory: execState.pathHistory,
+        stepCount: 0,
+      });
+    } catch (err) {
+      return errorResponse((err as Error).message);
+    }
+  },
+);
+
+// ─── Tool: Step (Agent-Driven) ───────────────────────────────────────────────
+
+server.registerTool(
+  'dp_step',
+  {
+    title: 'Advance Agent-Driven Execution',
+    description:
+      'Advance a step-by-step execution by choosing an edge. Returns the next decision context, or the final result if a terminal node is reached.',
+    inputSchema: {
+      executionId: z.string().describe('The execution ID from dp_start_execution'),
+      chosenEdgeId: z.string().describe('The edge ID you chose to follow'),
+    },
+  },
+  async (args) => {
+    try {
+      const state = stepExecutions.get(args.executionId);
+      if (!state) {
+        return errorResponse(
+          `Execution "${args.executionId}" not found. Active: ${[...stepExecutions.keys()].join(', ') || 'none'}`,
+        );
+      }
+      if (state.status !== 'active') {
+        return errorResponse(`Execution "${args.executionId}" is already completed.`);
+      }
+      if (state.stepCount >= state.maxSteps) {
+        state.tracker.endSession();
+        state.status = 'completed';
+        return jsonResponse({
+          executionId: args.executionId,
+          status: 'max_steps_exceeded',
+          pathTaken: state.pathHistory,
+          stepCount: state.stepCount,
+        });
+      }
+
+      // Validate edge
+      const outgoing = state.tree.getOutgoingEdges(state.currentNodeId);
+      const edge = outgoing.find((e) => e.id === args.chosenEdgeId);
+      if (!edge) {
+        return errorResponse(
+          `Invalid edge "${args.chosenEdgeId}". Valid: ${outgoing.map((e) => e.id).join(', ')}`,
+        );
+      }
+
+      // Record current node visit
+      state.tracker.recordEnhancedVisit(state.currentNodeId, 'success');
+      state.stepCount++;
+      state.currentNodeId = edge.targetId;
+      state.pathHistory.push(edge.targetId);
+
+      const nextNode = state.tree.getNode(edge.targetId);
+      if (!nextNode) {
+        return errorResponse(`Target node "${edge.targetId}" not found`);
+      }
+
+      // Process tool_call nodes automatically
+      if (nextNode.type === 'tool_call') {
+        // Tool results go into variables but agent still decides next edge
+        const data = (nextNode as any).data as {
+          toolName: string;
+          parameters: Record<string, unknown>;
+        };
+        state.variables[`tool_${data.toolName}`] = {
+          note: 'Tool execution skipped in agent-driven mode',
+        };
+      }
+
+      // Terminal check
+      if (nextNode.type === 'success' || nextNode.type === 'failure') {
+        state.tracker.recordEnhancedVisit(
+          nextNode.id,
+          nextNode.type === 'success' ? 'success' : 'failure',
+        );
+        state.tracker.endSession();
+        state.status = 'completed';
+        return jsonResponse({
+          executionId: args.executionId,
+          status: nextNode.type,
+          finalNode: {
+            id: nextNode.id,
+            type: nextNode.type,
+            label: nextNode.label,
+          },
+          pathTaken: state.pathHistory,
+          stepCount: state.stepCount,
+          variables: state.variables,
+        });
+      }
+
+      // Return next decision context
+      const nextOutgoing = state.tree.getOutgoingEdges(edge.targetId);
+
+      // If single outgoing edge, auto-advance
+      if (nextOutgoing.length === 1) {
+        // Recurse with the single edge
+        const singleEdge = nextOutgoing[0]!;
+        return jsonResponse({
+          executionId: args.executionId,
+          status: 'auto_advanced',
+          currentNode: {
+            id: nextNode.id,
+            type: nextNode.type,
+            label: nextNode.label,
+          },
+          autoFollowedEdge: singleEdge.id,
+          message: `Single outgoing edge — auto-advanced. Call dp_step again with edge "${singleEdge.id}" to continue, or it was followed automatically.`,
+          availableEdges: [{
+            edgeId: singleEdge.id,
+            targetNodeId: singleEdge.targetId,
+            targetLabel: state.tree.getNode(singleEdge.targetId)?.label,
+            condition: singleEdge.condition,
+          }],
+          pathHistory: state.pathHistory,
+          stepCount: state.stepCount,
+        });
+      }
+
+      const recommendation = state.tracker.getAllSessions().length > 0
+        ? new RecommendationEngine(state.tree, state.tracker).getEdgeRecommendation(edge.targetId)
+        : null;
+
+      return jsonResponse({
+        executionId: args.executionId,
+        status: 'awaiting_decision',
+        currentNode: {
+          id: nextNode.id,
+          type: nextNode.type,
+          label: nextNode.label,
+        },
+        availableEdges: nextOutgoing.map((e) => ({
+          edgeId: e.id,
+          targetNodeId: e.targetId,
+          targetLabel: state.tree.getNode(e.targetId)?.label,
+          condition: e.condition,
+        })),
+        recommendation: recommendation
+          ? {
+              edgeId: recommendation.recommendedEdgeId,
+              confidence: recommendation.confidence,
+              reasoning: recommendation.reasoning,
+            }
+          : null,
+        pathHistory: state.pathHistory,
+        stepCount: state.stepCount,
+        variables: state.variables,
+      });
+    } catch (err) {
+      return errorResponse((err as Error).message);
+    }
+  },
+);
+
 // ─── Tool: Export Tree ────────────────────────────────────────────────────────
 
 server.registerTool(
   'dp_export_tree',
   {
     title: 'Export Decision Tree',
-    description: 'Export a loaded tree to JSON. Optionally write to a file.',
+    description:
+      'Export a loaded tree to JSON. Set includeHistory to bundle session history for teammate onboarding. Optionally write to a file.',
     inputSchema: {
       treeId: z.string().describe('ID of the loaded tree'),
       filePath: z.string().optional().describe('File path to write JSON to'),
+      includeHistory: z
+        .boolean()
+        .optional()
+        .describe(
+          'Include session history in the export. Creates a bundle with tree + sessions. Default: false',
+        ),
     },
   },
   async (args) => {
     try {
       const state = getTree(args.treeId);
-      const json = serializer.toJSON(state.tree);
+
+      let output: unknown;
+      if (args.includeHistory) {
+        const sessions = await sessionStore.load(args.treeId);
+        const compactionSummary =
+          await sessionStore.getCompactionSummary(args.treeId);
+        output = {
+          bundle: true,
+          version: 1,
+          treeId: args.treeId,
+          tree: serializer.serialize(state.tree),
+          sessions,
+          compactionSummary,
+          exportedAt: new Date().toISOString(),
+        };
+      } else {
+        output = serializer.serialize(state.tree);
+      }
+
+      const json = JSON.stringify(output, null, 2);
 
       if (args.filePath) {
         const resolved = path.resolve(args.filePath);
         fs.writeFileSync(resolved, json, 'utf-8');
         return jsonResponse({
           exported: true,
+          bundled: args.includeHistory ?? false,
           path: resolved,
           bytes: json.length,
+          sessionCount: args.includeHistory
+            ? (await sessionStore.count(args.treeId))
+            : 0,
         });
       }
 
@@ -1017,7 +1408,132 @@ server.registerTool(
   },
 );
 
+// ─── Tool: Import Tree ───────────────────────────────────────────────────────
+
+server.registerTool(
+  'dp_import_tree',
+  {
+    title: 'Import Decision Tree',
+    description:
+      'Import a decision tree from a bundle (exported with includeHistory) or plain tree JSON. Restores the tree, its metadata, and optionally its session history. Use this to onboard from a teammate\'s export.',
+    inputSchema: {
+      source: z
+        .string()
+        .describe(
+          'File path to a .json export or inline JSON string',
+        ),
+      treeId: z
+        .string()
+        .optional()
+        .describe(
+          'Custom ID for the imported tree. Defaults to the bundled treeId or filename.',
+        ),
+      importHistory: z
+        .boolean()
+        .optional()
+        .describe(
+          'Whether to import session history from a bundle. Default: true',
+        ),
+    },
+  },
+  async (args) => {
+    try {
+      let json: string;
+      if (args.source.trim().startsWith('{')) {
+        json = args.source;
+      } else {
+        const filePath = path.resolve(args.source);
+        if (!fs.existsSync(filePath)) {
+          return errorResponse(`File not found: ${filePath}`);
+        }
+        json = fs.readFileSync(filePath, 'utf-8');
+      }
+
+      const parsed = JSON.parse(json) as Record<string, unknown>;
+      const isBundle = parsed.bundle === true;
+
+      let tree: import('../core/DecisionTree.js').DecisionTree;
+      let importedSessions = 0;
+      let treeId: string;
+
+      if (isBundle) {
+        // Bundle format: { bundle: true, tree, sessions, treeId }
+        const bundleTree = parsed.tree as import('../serialization/TreeSerializer.js').SerializedTree;
+        tree = serializer.deserialize(bundleTree);
+        treeId =
+          args.treeId ??
+          (parsed.treeId as string) ??
+          `imported-${trees.size + 1}`;
+
+        if (args.importHistory !== false && Array.isArray(parsed.sessions)) {
+          const sessions =
+            parsed.sessions as import('../persistence/SessionStore.js').PersistedSession[];
+          for (const session of sessions) {
+            await sessionStore.append(treeId, session);
+          }
+          importedSessions = sessions.length;
+        }
+      } else {
+        // Plain tree JSON
+        tree = serializer.deserialize(
+          parsed as unknown as import('../serialization/TreeSerializer.js').SerializedTree,
+        );
+        treeId =
+          args.treeId ??
+          (args.source.trim().startsWith('{')
+            ? `imported-${trees.size + 1}`
+            : path.basename(args.source, '.json'));
+      }
+
+      const { tracker, priorSessions } = await createPersistentTracker(treeId);
+      trees.set(treeId, {
+        tree,
+        tracker,
+        name: tree.metadata.taskName ?? treeId,
+        loadedAt: new Date().toISOString(),
+        priorSessions,
+      });
+
+      // Update tree index
+      const meta = tree.metadata;
+      const importIndexEntry: Parameters<typeof treeIndex.upsert>[0] = {
+        treeId,
+        tags: meta.tags ?? [],
+        taskName: meta.taskName ?? treeId,
+        sessionCount: priorSessions,
+        lastUsed: new Date().toISOString(),
+      };
+      if (meta.family !== undefined) importIndexEntry.family = meta.family;
+      if (meta.description !== undefined)
+        importIndexEntry.description = meta.description;
+      if (meta.createdAt !== undefined)
+        importIndexEntry.createdAt = meta.createdAt;
+      if (!args.source.trim().startsWith('{'))
+        importIndexEntry.treePath = path.resolve(args.source);
+      await treeIndex.upsert(importIndexEntry);
+
+      return jsonResponse({
+        treeId,
+        family: meta.family,
+        tags: meta.tags,
+        nodeCount: tree.nodeCount,
+        edgeCount: tree.edgeCount,
+        importedSessions,
+        totalSessions: priorSessions,
+        message: `Tree "${treeId}" imported${importedSessions > 0 ? ` with ${importedSessions} session(s) of history` : ''}. Ready for execution.`,
+      });
+    } catch (err) {
+      return errorResponse(`Import failed: ${(err as Error).message}`);
+    }
+  },
+);
+
 // ─── Start ────────────────────────────────────────────────────────────────────
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
+
+// Check if the connected client supports sampling
+if (isSamplingAvailable(server.server)) {
+  samplingAdapter = new SamplingAdapter(server.server);
+}

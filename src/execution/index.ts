@@ -4,6 +4,7 @@ export type {
   ExecutionEvents,
   ExecutionResult,
   IDecisionMaker,
+  TokenUsage,
   ToolHandler,
   TreeExecutorConfig,
 } from './TreeExecutor.js';
