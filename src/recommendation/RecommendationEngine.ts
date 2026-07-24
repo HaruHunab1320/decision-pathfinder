@@ -1,3 +1,8 @@
+import {
+  ageDecayWeight,
+  type HistoryRun,
+  scoreHistory,
+} from '@_89/confidence-kernel';
 import type {
   EnhancedPathRecord,
   IDecisionTree,
@@ -71,20 +76,22 @@ export class RecommendationEngine {
    * A session exactly halfLife days old gets weight 0.5.
    * A brand-new session gets weight 1.0.
    * Disabled (weight always 1.0) when halfLife is 0 or Infinity.
+   *
+   * Delegates the decay math to the shared confidence-kernel
+   * (`ageDecayWeight(ageDays, halfLife, 'e')`), which is byte-for-byte
+   * identical to the former inline `exp(-ageDays·ln2/halfLife)` — including
+   * the age-clamp at 0 (a brand-new or future-dated session gets weight 1.0)
+   * and the disabled case (halfLife <= 0 or non-finite → 1).
    */
-  private sessionAgeWeight(session: EnhancedPathRecord[]): number {
-    if (
-      this.decayHalfLifeDays <= 0 ||
-      !Number.isFinite(this.decayHalfLifeDays)
-    ) {
-      return 1;
-    }
+  private sessionAgeWeight(
+    session: EnhancedPathRecord[],
+    now: number = Date.now(),
+  ): number {
     const firstRecord = session[0];
     if (!firstRecord) return 1;
-    const ageMs = Date.now() - firstRecord.timestamp;
+    const ageMs = now - firstRecord.timestamp;
     const ageDays = ageMs / (1000 * 60 * 60 * 24);
-    if (ageDays <= 0) return 1;
-    return Math.exp((-ageDays * Math.LN2) / this.decayHalfLifeDays);
+    return ageDecayWeight(ageDays, this.decayHalfLifeDays, 'e');
   }
 
   /** All sessions: tracker-owned + pooled from family siblings. */
@@ -243,7 +250,16 @@ export class RecommendationEngine {
     };
   }
 
-  getEdgeRecommendation(fromNodeId: NodeId): EdgeRecommendation | null {
+  /**
+   * @param now Current time in epoch ms, used for age decay. Injectable for
+   *   deterministic tests; defaults to `Date.now()`. A single clock is shared by
+   *   the weighted tally (reasoning/tiebreaker) and the kernel scoring call so
+   *   they never diverge by sub-millisecond drift.
+   */
+  getEdgeRecommendation(
+    fromNodeId: NodeId,
+    now: number = Date.now(),
+  ): EdgeRecommendation | null {
     const outgoingEdges = this.tree.getOutgoingEdges(fromNodeId);
     if (outgoingEdges.length === 0) {
       return null;
@@ -251,15 +267,22 @@ export class RecommendationEngine {
 
     const sessions = this.getAllSessions();
 
-    // For each outgoing edge target, track weighted success/total counts.
-    // Each session's contribution is scaled by its age weight (recent = ~1, old = decayed).
+    // For each outgoing edge target, collect one HistoryRun per edge traversal
+    // occurrence. The confidence-kernel re-derives the age-decay weight from each
+    // run's timestamp, so we record the session's first-record timestamp (the
+    // value the former inline decay read) rather than pre-summing weights here.
+    // `successfulLengths` is retained separately because DP's efficiency factor
+    // is GLOBAL (tree-wide shortest / edge-avg), not a per-run steps notion —
+    // the kernel's default efficiencyFactor cannot reproduce it, so we compute
+    // the number ourselves and pass it to scoreHistory.
     const edgeOutcomes = new Map<
       string,
       {
         edgeId: string;
         targetNodeId: NodeId;
-        successes: number; // weighted sum
-        total: number; // weighted sum
+        runs: HistoryRun[];
+        successes: number; // weighted sum — reasoning/tiebreaker only
+        total: number; // weighted sum — reasoning/tiebreaker only
         successfulLengths: number[];
       }
     >();
@@ -268,6 +291,7 @@ export class RecommendationEngine {
       edgeOutcomes.set(edge.id, {
         edgeId: edge.id,
         targetNodeId: edge.targetId,
+        runs: [],
         successes: 0,
         total: 0,
         successfulLengths: [],
@@ -284,8 +308,13 @@ export class RecommendationEngine {
       }
     }
 
+    let runSeq = 0;
     for (const session of sessions) {
-      const weight = this.sessionAgeWeight(session);
+      // Per-session age-decay weight (kernel-backed). Recorded into each run's
+      // timestamp so scoreHistory re-derives the identical weight; also summed
+      // directly for the reasoning string and the sample-count tiebreaker.
+      const weight = this.sessionAgeWeight(session, now);
+      const sessionTimestamp = session[0]?.timestamp ?? now;
 
       for (let i = 0; i < session.length - 1; i++) {
         const record = session[i] as EnhancedPathRecord;
@@ -297,12 +326,17 @@ export class RecommendationEngine {
             if (edge.targetId === nextRecord.nodeId) {
               const outcomes = edgeOutcomes.get(edge.id);
               if (outcomes) {
-                outcomes.total += weight;
                 // Check if the rest of the session from this point was successful
                 const remainingRecords = session.slice(i + 1);
                 const allSuccessful = remainingRecords.every(
                   (r) => r.status === 'success' || r.status === 'pending',
                 );
+                outcomes.total += weight;
+                outcomes.runs.push({
+                  id: `${edge.id}#${runSeq++}`,
+                  timestamp: sessionTimestamp,
+                  outcome: allSuccessful ? 'success' : 'failure',
+                });
                 if (allSuccessful) {
                   outcomes.successes += weight;
                   outcomes.successfulLengths.push(session.length);
@@ -315,18 +349,17 @@ export class RecommendationEngine {
       }
     }
 
-    // Compute composite confidence for each edge: success_rate × sample_factor × efficiency_factor
-    // Efficiency factor rewards edges whose successful sessions are short relative to the
-    // shortest successful session seen for this tree.
+    // Composite confidence per edge: rate × sample × efficiency.
+    // Delegated to the shared confidence-kernel (posture 'skip', e-decay,
+    // saturationRuns 10, halfLife = this.decayHalfLifeDays). The kernel reproduces
+    // the former inline `rate × min(total/10,1) × efficiencyFactor` bit-for-bit;
+    // the efficiency factor stays host-computed (GLOBAL shortest / edge-avg) and
+    // is passed through as the `efficiency` number.
     const computeConfidence = (outcomes: {
-      successes: number;
-      total: number;
+      runs: HistoryRun[];
       successfulLengths: number[];
     }): number => {
-      const rate = outcomes.total > 0 ? outcomes.successes / outcomes.total : 0;
-      const sampleFactor = Math.min(outcomes.total / 10, 1);
-
-      let efficiencyFactor = 1;
+      let efficiency = 1;
       if (
         outcomes.successfulLengths.length > 0 &&
         shortestSuccessLength !== Number.POSITIVE_INFINITY
@@ -334,10 +367,18 @@ export class RecommendationEngine {
         const avgLen =
           outcomes.successfulLengths.reduce((a, b) => a + b, 0) /
           outcomes.successfulLengths.length;
-        efficiencyFactor = shortestSuccessLength / avgLen;
+        efficiency = shortestSuccessLength / avgLen;
       }
 
-      return rate * sampleFactor * efficiencyFactor;
+      const result = scoreHistory(outcomes.runs, {
+        posture: 'skip',
+        halfLifeDays: this.decayHalfLifeDays,
+        saturationRuns: 10,
+        decayBase: 'e',
+        efficiency,
+        now,
+      });
+      return result ? result.confidence : 0;
     };
 
     // Find the best edge (highest composite confidence, with sample count as tiebreaker)
@@ -345,6 +386,7 @@ export class RecommendationEngine {
       | {
           edgeId: string;
           targetNodeId: NodeId;
+          runs: HistoryRun[];
           successes: number;
           total: number;
           successfulLengths: number[];

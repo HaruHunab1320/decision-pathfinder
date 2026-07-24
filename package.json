@@ -61,6 +61,7 @@
     "node": ">=20"
   },
   "dependencies": {
+    "@_89/confidence-kernel": "file:_89-confidence-kernel-0.1.0.tgz",
     "@anthropic-ai/sdk": "^0.86.1",
     "@google/generative-ai": "^0.24.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
