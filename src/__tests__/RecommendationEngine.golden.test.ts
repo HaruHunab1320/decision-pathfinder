@@ -45,8 +45,9 @@ function session(
   nodeIds: string[],
   finalStatus: 'success' | 'failure',
   ageDays: number,
+  now: number = Date.now(),
 ): EnhancedPathRecord[] {
-  const base = Date.now() - ageDays * DAY_MS;
+  const base = now - ageDays * DAY_MS;
   return nodeIds.map((nodeId, i) => ({
     nodeId,
     timestamp: base + i,
@@ -198,14 +199,18 @@ describe('GOLDEN: RecommendationEngine confidence == original inline formula', (
 
   it("saturates to full confidence with 10 recent clean successes (would trigger DP's >=0.6 override)", () => {
     // 10 identical shortest-path successes → rate 1, sample 1, eff 1 → 1.0
+    // Fixtures and the engine must share one clock: sampling Date.now() twice
+    // leaves the sessions microseconds old, and the resulting decay shaves
+    // ~3e-11 off the expected 1.0 (below this assertion's 1e-12 tolerance).
+    const now = Date.now();
     const sessions: EnhancedPathRecord[][] = Array.from({ length: 10 }, () =>
-      session(['start', 'A', 'end'], 'success', 0),
+      session(['start', 'A', 'end'], 'success', 0, now),
     );
     const { tree } = buildTree();
     const engine = new RecommendationEngine(tree, fakeTracker(sessions), {
       decayHalfLifeDays: 30,
     });
-    const rec = engine.getEdgeRecommendation('start')!;
+    const rec = engine.getEdgeRecommendation('start', now)!;
     expect(rec.confidence).toBeCloseTo(1, 12);
     expect(rec.confidence).toBeGreaterThanOrEqual(0.6);
   });
