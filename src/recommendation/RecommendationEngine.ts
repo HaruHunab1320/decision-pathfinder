@@ -1,5 +1,6 @@
 import {
   ageDecayWeight,
+  detectDrift,
   type HistoryRun,
   scoreHistory,
 } from '@_89/confidence-kernel';
@@ -36,10 +37,19 @@ export interface EdgeRecommendation {
   targetNodeId: NodeId;
   confidence: number;
   reasoning: string;
+  /**
+   * True when this edge's RECENT success rate has collapsed relative to its
+   * lifetime rate (see {@link RecommendationEngineOptions.driftThreshold}).
+   * A drifted edge has had its confidence clamped to
+   * `driftDemotedCeiling` so it can no longer trigger the high-confidence
+   * LLM-skip override. Always reported, even when demotion is disabled.
+   */
+  drifted: boolean;
   alternativeEdges: Array<{
     edgeId: string;
     targetNodeId: NodeId;
     confidence: number;
+    drifted: boolean;
   }>;
 }
 
@@ -50,6 +60,38 @@ export interface RecommendationEngineOptions {
    * to disable decay. Default: 30 days.
    */
   decayHalfLifeDays?: number;
+  /**
+   * Apply drift demotion (clamp a drifted edge's confidence to
+   * {@link driftDemotedCeiling}). Detection always runs and is reported via
+   * `EdgeRecommendation.drifted`; this only controls the clamp.
+   * Default: true.
+   */
+  driftDemotion?: boolean;
+  /**
+   * How many of an edge's most-recent traversals form the "recent" window
+   * used for drift detection. Default: 5.
+   */
+  driftRecentN?: number;
+  /**
+   * How far an edge's recent success rate may fall below its lifetime rate
+   * before it counts as drift. Default: 0.2 (20 percentage points).
+   */
+  driftThreshold?: number;
+  /**
+   * Minimum traversals of an edge before drift is evaluated at all — below
+   * this, a couple of unlucky runs cannot demote an edge.
+   * Default: `driftRecentN`.
+   */
+  driftMinRuns?: number;
+  /**
+   * Confidence ceiling applied to a drifted edge. Default: 0.5.
+   *
+   * Deliberately between the two consumer thresholds: below the 0.6
+   * LLM-skip override (so a collapsing edge can never skip the LLM) but above
+   * the 0.2 "bias the prompt" tier (so the edge is still offered to the LLM as
+   * a hint). Demote, don't erase.
+   */
+  driftDemotedCeiling?: number;
 }
 
 export class RecommendationEngine {
@@ -60,6 +102,11 @@ export class RecommendationEngine {
   pooledSessions: EnhancedPathRecord[][] = [];
 
   private decayHalfLifeDays: number;
+  private driftDemotion: boolean;
+  private driftRecentN: number;
+  private driftThreshold: number;
+  private driftMinRuns: number;
+  private driftDemotedCeiling: number;
 
   constructor(
     private tree: IDecisionTree,
@@ -67,6 +114,11 @@ export class RecommendationEngine {
     options?: RecommendationEngineOptions,
   ) {
     this.decayHalfLifeDays = options?.decayHalfLifeDays ?? 30;
+    this.driftDemotion = options?.driftDemotion ?? true;
+    this.driftRecentN = options?.driftRecentN ?? 5;
+    this.driftThreshold = options?.driftThreshold ?? 0.2;
+    this.driftMinRuns = options?.driftMinRuns ?? this.driftRecentN;
+    this.driftDemotedCeiling = options?.driftDemotedCeiling ?? 0.5;
   }
 
   /**
@@ -381,6 +433,34 @@ export class RecommendationEngine {
       return result ? result.confidence : 0;
     };
 
+    /**
+     * DRIFT DEMOTION (kernel `detectDrift`).
+     *
+     * The composite score above is age-decayed, so an edge that used to work
+     * and just collapsed keeps a high number until decay slowly catches up —
+     * long enough to keep skipping the LLM onto a path that now fails.
+     * `detectDrift` compares the edge's most recent `driftRecentN` traversals
+     * (unweighted) against its lifetime rate and flags a collapse.
+     *
+     * Mechanism: CLAMP the drifted edge's confidence to `driftDemotedCeiling`
+     * (0.5 by default) rather than excluding it from selection. Rationale:
+     *   - Clamping happens BEFORE best-edge selection, so a healthy sibling
+     *     edge that scores above the ceiling naturally overtakes the drifted
+     *     one — which is what exclusion would have achieved anyway.
+     *   - But when the drifted edge is the *only* candidate we still return it,
+     *     with an honest sub-override number, instead of returning `null` and
+     *     losing the ranking/reasoning consumers rely on.
+     *   - 0.5 sits below the 0.6 LLM-skip override (so a drifted edge can never
+     *     trigger the skip) yet above the 0.2 prompt-bias tier (so the LLM is
+     *     still told what history used to prefer). Demote, don't erase.
+     */
+    const driftFor = (runs: HistoryRun[]): boolean =>
+      detectDrift(runs, {
+        recentN: this.driftRecentN,
+        driftThreshold: this.driftThreshold,
+        minRuns: this.driftMinRuns,
+      }).drifted;
+
     // Find the best edge (highest composite confidence, with sample count as tiebreaker)
     let bestEdge:
       | {
@@ -394,20 +474,27 @@ export class RecommendationEngine {
       | undefined;
     let bestConfidence = -1;
     let bestRate = -1;
+    let bestDrifted = false;
 
     const allEdgeResults: Array<{
       edgeId: string;
       targetNodeId: NodeId;
       confidence: number;
+      drifted: boolean;
     }> = [];
 
     for (const outcomes of edgeOutcomes.values()) {
-      const conf = computeConfidence(outcomes);
+      let conf = computeConfidence(outcomes);
+      const drifted = driftFor(outcomes.runs);
+      if (drifted && this.driftDemotion) {
+        conf = Math.min(conf, this.driftDemotedCeiling);
+      }
       const rate = outcomes.total > 0 ? outcomes.successes / outcomes.total : 0;
       allEdgeResults.push({
         edgeId: outcomes.edgeId,
         targetNodeId: outcomes.targetNodeId,
         confidence: conf,
+        drifted,
       });
       if (
         conf > bestConfidence ||
@@ -415,6 +502,7 @@ export class RecommendationEngine {
       ) {
         bestConfidence = conf;
         bestRate = rate;
+        bestDrifted = drifted;
         bestEdge = outcomes;
       }
     }
@@ -435,9 +523,12 @@ export class RecommendationEngine {
         ? bestEdge.successfulLengths.reduce((a, b) => a + b, 0) /
           bestEdge.successfulLengths.length
         : 0;
+    const driftNote = bestDrifted
+      ? ` DRIFT: recent success rate collapsed vs lifetime (last ${this.driftRecentN} runs, threshold ${this.driftThreshold})${this.driftDemotion ? ` — confidence demoted to <=${this.driftDemotedCeiling}` : ''}.`
+      : '';
     const reasoning =
       totalSamples > 0
-        ? `Edge "${bestEdge.edgeId}" succeeded in ${bestEdge.successes}/${totalSamples} sessions (${(bestRate * 100).toFixed(1)}% rate, avg path length ${avgLen.toFixed(1)}, shortest known ${shortestSuccessLength === Number.POSITIVE_INFINITY ? 'n/a' : shortestSuccessLength}).`
+        ? `Edge "${bestEdge.edgeId}" succeeded in ${bestEdge.successes}/${totalSamples} sessions (${(bestRate * 100).toFixed(1)}% rate, avg path length ${avgLen.toFixed(1)}, shortest known ${shortestSuccessLength === Number.POSITIVE_INFINITY ? 'n/a' : shortestSuccessLength}).${driftNote}`
         : `No historical data available for edges from node "${fromNodeId}". Recommendation is based on default ordering.`;
 
     return {
@@ -446,6 +537,7 @@ export class RecommendationEngine {
       targetNodeId: bestEdge.targetNodeId,
       confidence,
       reasoning,
+      drifted: bestDrifted,
       alternativeEdges,
     };
   }

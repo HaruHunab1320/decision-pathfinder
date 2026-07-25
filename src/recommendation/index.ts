@@ -1,4 +1,10 @@
 export type {
+  GradedSignal,
+  GradedSignalInput,
+  GuidedDecisionMakerOptions,
+} from './GuidedDecisionMaker.js';
+export { createGuidedDecisionMaker } from './GuidedDecisionMaker.js';
+export type {
   EdgeRecommendation,
   NodeStats,
   PathAnalysis,

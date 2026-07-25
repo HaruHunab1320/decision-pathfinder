@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Drift demotion** (behavior change, on by default): an edge whose recent
+  success rate has collapsed relative to its lifetime rate — detected with the
+  confidence-kernel's `detectDrift` — has its confidence clamped to 0.5, so it
+  can no longer trigger the ≥0.6 LLM-skip override while slow age decay catches
+  up. Still above the 0.2 hint tier, so the edge is offered to the LLM as a
+  suggestion rather than erased. Configurable via `driftDemotion`,
+  `driftRecentN` (5), `driftThreshold` (0.2), `driftMinRuns`,
+  `driftDemotedCeiling` (0.5) on `RecommendationEngineOptions`. Set
+  `driftDemotion: false` for the previous behavior.
+- `EdgeRecommendation` (and each entry of `alternativeEdges`) now carries a
+  `drifted: boolean`. Detection is reported even when demotion is disabled.
+
+### Added
+
+- **Graded gate** (opt-in, default off): `createGuidedDecisionMaker(engine,
+  inner, opts)` extracts the MCP server's confidence tiering (≥0.6 skip, ≥0.2
+  hint) into a reusable, testable decision maker. Supplying an optional
+  `gradedSignal` makes a skip additionally require
+  `combine([history, signal], 'min') >= overrideThreshold`, so a high history
+  prior cannot unilaterally skip work. The signal is consulted only when history
+  alone would have skipped, and fails closed. In the MCP server, enable it by
+  pointing `DP_GRADED_GATE_MODULE` at a module exporting the signal; unset, the
+  override behaves exactly as before.
+
 ## [1.3.0] - 2026-04-18
 
 ### Added

@@ -47,6 +47,7 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import * as url from 'node:url';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
@@ -71,6 +72,8 @@ import {
   SessionStore,
   TreeIndex,
 } from '../persistence/index.js';
+import type { GradedSignal } from '../recommendation/GuidedDecisionMaker.js';
+import { createGuidedDecisionMaker } from '../recommendation/GuidedDecisionMaker.js';
 import { RecommendationEngine } from '../recommendation/RecommendationEngine.js';
 import { TreeEvolution } from '../recommendation/TreeEvolution.js';
 import { TreeSerializer } from '../serialization/TreeSerializer.js';
@@ -129,6 +132,46 @@ const sessionStore: ISessionStore =
 const treeIndex = new TreeIndex(sessionStore.getStoreDir());
 // Sampling adapter — initialized after connection if client supports it
 let samplingAdapter: SamplingAdapter | null = null;
+
+/**
+ * OPT-IN graded gate (default: off → unchanged behavior).
+ *
+ * By default a >=0.6 history confidence skips the branch-point LLM call on its
+ * own. Set `DP_GRADED_GATE_MODULE=/abs/path/to/signal.js` to require a SECOND
+ * cheap signal before any skip: the module's default export (or a named
+ * `gradedSignal` export) is a `GradedSignal` — `({ context, recommendation })
+ * => number | OracleResult` — min-combined with the history confidence via the
+ * confidence-kernel's `combine(..., 'min')`. Because `min` takes the weakest
+ * check, the history prior can only ever be pulled DOWN by it.
+ *
+ * If the module fails to load, the server logs to stderr and stays in default
+ * (pure history) mode rather than silently gating.
+ */
+let gradedSignal: GradedSignal | undefined;
+
+async function loadGradedSignal(): Promise<void> {
+  const modulePath = process.env.DP_GRADED_GATE_MODULE;
+  if (!modulePath) return;
+  try {
+    const resolved = path.resolve(modulePath);
+    const mod = (await import(url.pathToFileURL(resolved).href)) as {
+      default?: unknown;
+      gradedSignal?: unknown;
+    };
+    const fn = mod.gradedSignal ?? mod.default;
+    if (typeof fn !== 'function') {
+      throw new Error(
+        'module must export a function as `default` or `gradedSignal`',
+      );
+    }
+    gradedSignal = fn as GradedSignal;
+    console.error(`[decision-pathfinder] graded gate enabled: ${resolved}`);
+  } catch (err) {
+    console.error(
+      `[decision-pathfinder] DP_GRADED_GATE_MODULE failed to load (${(err as Error).message}) — falling back to pure history override`,
+    );
+  }
+}
 
 async function createPersistentTracker(treeId: string): Promise<{
   tracker: PersistentPathTracker;
@@ -832,36 +875,16 @@ server.registerTool(
       ) {
         const engine = new RecommendationEngine(tree, tracker);
         engine.pooledSessions = familySessions;
-        const inner = provider.adapter;
-        decisionMaker = {
-          async decide(context) {
-            const rec = engine.getEdgeRecommendation(context.currentNodeId);
-            if (rec && rec.confidence >= 0.6) {
-              const valid = context.availableEdges.some(
-                (e) => e.id === rec.recommendedEdgeId,
-              );
-              if (valid) {
-                return {
-                  chosenEdgeId: rec.recommendedEdgeId,
-                  reasoning: `Override (confidence: ${(rec.confidence * 100).toFixed(0)}%)`,
-                };
-              }
-            }
-            if (rec && rec.confidence >= 0.2) {
-              return inner.decide({
-                ...context,
-                metadata: {
-                  ...context.metadata,
-                  recommendation: {
-                    suggestedEdgeId: rec.recommendedEdgeId,
-                    confidence: rec.confidence,
-                  },
-                },
-              });
-            }
-            return inner.decide(context);
-          },
-        };
+        // Tiering (>=0.6 skip, >=0.2 hint) lives in createGuidedDecisionMaker.
+        // `gradedSignal` is undefined unless DP_GRADED_GATE_MODULE is set, so
+        // the default path is the original history-only override.
+        decisionMaker = createGuidedDecisionMaker(engine, provider.adapter, {
+          overrideThreshold: 0.6,
+          hintThreshold: 0.2,
+          ...(gradedSignal ? { gradedSignal } : {}),
+          onGateBlocked: (detail) =>
+            console.error(`[decision-pathfinder] ${detail}`),
+        });
       }
 
       const executor = new TreeExecutor(tree, decisionMaker, tracker, {
@@ -926,6 +949,9 @@ server.registerTool(
         targetNodeId: rec.targetNodeId,
         confidence: rec.confidence,
         reasoning: rec.reasoning,
+        // True when this edge's recent success rate collapsed vs its lifetime
+        // rate — its confidence has been demoted below the override threshold.
+        drifted: rec.drifted,
         alternatives: rec.alternativeEdges,
         familyPooled: siblingCount > 0,
         familySiblings: siblingCount,
@@ -1534,6 +1560,8 @@ server.registerTool(
 );
 
 // ─── Start ────────────────────────────────────────────────────────────────────
+
+await loadGradedSignal();
 
 const transport = new StdioServerTransport();
 await server.connect(transport);

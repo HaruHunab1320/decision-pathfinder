@@ -17,7 +17,7 @@ Four things make the flywheel work:
 
 1. **Efficiency-weighted confidence** — a 3-step successful path ranks higher than a 10-step successful path. Agents naturally discover shortcuts; wasted tool calls get pruned.
 2. **Persistent history** — completed sessions go to `~/.decision-pathfinder/sessions/{treeId}.jsonl`. Every process restart picks up where the last one left off. Auto-compaction keeps files fast past 1000 sessions.
-3. **Confidence-gated override** — above 60% confidence, the LLM call is skipped entirely and the historically-best edge is taken directly. The tool calls still run (they do real work) — only the decision-making LLM call disappears.
+3. **Confidence-gated override** — above 60% confidence, the LLM call is skipped entirely and the historically-best edge is taken directly. The tool calls still run (they do real work) — only the decision-making LLM call disappears. An edge whose *recent* success rate has collapsed is [demoted](#drift-demotion) out of that override, and higher-stakes deployments can require [a second signal](#graded-gate-opt-in) before any skip.
 4. **Task families** — sibling trees (e.g. `deploy-web-app`, `deploy-api-app`) share a family. A brand-new tree inherits recommendations from experienced siblings at shared decision points — no cold start.
 
 ## Where LLMs fit in
@@ -238,6 +238,61 @@ confidence = weighted_success_rate × sample_factor × efficiency_factor
   efficiency_factor = shortest_known / this_path_avg_length
 ```
 
+The scoring math is delegated to [`@_89/confidence-kernel`](https://www.npmjs.com/package/@_89/confidence-kernel) (`scoreHistory` with the `skip` posture).
+
+### Drift demotion
+
+Age decay is slow by design. An edge with a long, excellent track record that
+*just* started failing keeps a high score for days — long enough to keep
+skipping the LLM onto a path that no longer works. So each edge is additionally
+checked with the kernel's `detectDrift`: if its recent success rate has
+collapsed relative to its lifetime rate, its confidence is **clamped to 0.5**.
+
+```typescript
+const engine = new RecommendationEngine(tree, tracker, {
+  driftDemotion: true,        // default — set false for the pre-1.4 behavior
+  driftRecentN: 5,            // size of the "recent" window (traversals of that edge)
+  driftThreshold: 0.2,        // recent must fall >20 points below lifetime
+  driftMinRuns: 5,            // defaults to driftRecentN — below this, no demotion
+  driftDemotedCeiling: 0.5,   // clamp applied to a drifted edge
+});
+
+const rec = engine.getEdgeRecommendation('decision-node-id');
+// { confidence: 0.5, drifted: true, reasoning: '... DRIFT: recent success rate collapsed ...' }
+```
+
+The 0.5 ceiling is deliberately **below the 0.6 override** (a drifted edge can
+never skip the LLM) but **above the 0.2 hint tier** (the LLM is still told what
+history used to prefer). Clamping happens before best-edge selection, so a
+healthy sibling edge scoring above the ceiling simply wins instead. Detection is
+always reported via `drifted`, even with `driftDemotion: false`.
+
+### Graded gate (opt-in)
+
+By default the ≥0.6 override skips the LLM on the history prior **alone**. In
+higher-stakes deployments you can require a second, cheap signal to agree —
+combined with the kernel's `combine([...], 'min')`, so the weakest check wins
+and a confident prior can never unilaterally skip work:
+
+```typescript
+import { createGuidedDecisionMaker } from 'decision-pathfinder';
+
+const decisionMaker = createGuidedDecisionMaker(engine, llmAdapter, {
+  overrideThreshold: 0.6,   // default
+  hintThreshold: 0.2,       // default
+  // OPTIONAL. Omit → pure history override (unchanged default behavior).
+  gradedSignal: async ({ context, recommendation }) => {
+    const ok = await preflightCheck(context.currentNodeId);
+    return ok ? 1 : 0.2;    // number, or { confidence, detail }
+  },
+});
+```
+
+The signal is consulted at most once per branch point, and only when history
+alone would already have skipped. If it throws, the gate **fails closed** — the
+LLM is called. When the gate blocks a skip, the recommendation falls through to
+the hint tier rather than disappearing.
+
 ## Serialization
 
 ```typescript
@@ -354,6 +409,27 @@ The server picks a provider in priority order:
 MCP sampling is zero-config — the host LLM (Claude, Cursor, etc.) handles the call, no API keys needed. Set `DP_NO_SAMPLING=1` to skip it.
 
 Override the model per-provider (`ANTHROPIC_MODEL`, `OPENAI_MODEL`, `GEMINI_MODEL`) or globally (`DP_MODEL`).
+
+### Requiring a second signal before a skip
+
+`dp_execute_tree` skips the branch-point LLM call whenever history confidence is
+≥0.6. To require a second check first (see [Graded gate](#graded-gate-opt-in)),
+point `DP_GRADED_GATE_MODULE` at an ES module whose default export (or a named
+`gradedSignal` export) is the signal function:
+
+```js
+// preflight-signal.mjs
+export default async ({ context, recommendation }) => {
+  return (await environmentLooksSane()) ? 1 : 0.2;
+};
+```
+
+```json
+{ "env": { "DP_GRADED_GATE_MODULE": "/abs/path/preflight-signal.mjs" } }
+```
+
+Unset (the default) the override behaves exactly as before. If the module fails
+to load, the server logs to stderr and stays in the default mode.
 
 ### Two LLMs at once
 
